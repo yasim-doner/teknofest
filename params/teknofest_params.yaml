@@ -1,0 +1,46 @@
+# ROS 2 parameter file for the Teknofest package nodes
+
+fallow_corridor:
+  ros__parameters:
+    target_speed: 0.25
+    min_speed: 0.05
+    max_angular_speed: 0.4
+    kp_center: 0.8
+    kp_avoid: 1.0
+    pitch_scale_factor: 1.5
+    min_speed_factor: 0.5
+    max_speed_factor: 2.0
+    lookahead_min_x: 0.3
+    lookahead_max_x: 3.5
+    lookahead_y: 2.2
+    crop_min_z: -0.65
+    crop_max_z: 0.65
+    grid_cell_size: 0.2
+    min_height_diff: 0.18
+    front_obstacle_dist: 1.8
+    front_stop_dist: 0.65
+    min_points_threshold: 15
+
+dynamic_obstacle:
+  ros__parameters:
+    target_speed: 0.25
+    detection_min_x: 0.4
+    detection_max_x: 2.2
+    detection_y: 0.6
+    crop_min_z: -0.65
+    crop_max_z: 0.65
+    grid_cell_size: 0.2
+    min_height_diff: 0.18
+    min_points_threshold: 15
+    crossing_duration: 4.0
+
+sign_detect:
+  ros__parameters:
+    image_topic: "/rover/camera/image_raw"
+    min_confidence: 0.18
+    min_margin: 0.015
+    stable_frames: 3
+    lost_frames: 5
+    min_candidate_size: 12
+    max_candidate_size: 60
+    max_candidates: 5

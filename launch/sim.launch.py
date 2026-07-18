@@ -25,6 +25,8 @@ SIGN_POSES = {
 def launch_setup(context, *args, **kwargs):
     # Retrieve configurations
     stage_val = context.launch_configurations.get('stage', '0')
+    use_sim_time_val = context.launch_configurations.get('use_sim_time', 'true')
+    use_sim_time_bool = use_sim_time_val.lower() == 'true'
     
     # Defaults
     x_val = context.launch_configurations.get('initial_x', '17.5')
@@ -57,9 +59,16 @@ def launch_setup(context, *args, **kwargs):
             'initial_x': x_val,
             'initial_y': y_val,
             'initial_z': z_val,
-            'initial_yaw': yaw_val
+            'initial_yaw': yaw_val,
+            'use_sim_time': use_sim_time_val
         }.items()
     )
+
+    teknofest_params_path = PathJoinSubstitution([
+        FindPackageShare('teknofest'),
+        'params',
+        'teknofest_params.yaml'
+    ])
 
     # Corridor Follower Node
     fallow_corridor_node = Node(
@@ -67,6 +76,7 @@ def launch_setup(context, *args, **kwargs):
         executable='fallow_corridor.py',
         name='fallow_corridor',
         output='screen',
+        parameters=[teknofest_params_path, {'use_sim_time': use_sim_time_bool}],
         arguments=['--ros-args', '--log-level', 'warn']
     )
 
@@ -75,7 +85,8 @@ def launch_setup(context, *args, **kwargs):
         package='teknofest',
         executable='dynamic_obstacle.py',
         name='dynamic_obstacle',
-        output='screen'
+        output='screen',
+        parameters=[teknofest_params_path, {'use_sim_time': use_sim_time_bool}]
     )
 
     # Sign Detector Node
@@ -83,7 +94,8 @@ def launch_setup(context, *args, **kwargs):
         package='teknofest',
         executable='sign_detect.py',
         name='sign_detect',
-        output='screen'
+        output='screen',
+        parameters=[teknofest_params_path, {'use_sim_time': use_sim_time_bool}]
     )
 
     # Command Switch Node
@@ -91,7 +103,8 @@ def launch_setup(context, *args, **kwargs):
         package='teknofest',
         executable='cmd_switch.py',
         name='cmd_switch',
-        output='screen'
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time_bool}]
     )
 
     return [
@@ -134,11 +147,18 @@ def generate_launch_description():
         description="Yaw rotation where rover would be spawned"
     )
 
+    use_sim_time_arg = DeclareLaunchArgument(
+        name="use_sim_time",
+        default_value="true",
+        description="Use simulation (Gazebo) clock if true"
+    )
+
     return LaunchDescription([
         stage_arg,
         x_arg,
         y_arg,
         z_arg,
         yaw_arg,
+        use_sim_time_arg,
         OpaqueFunction(function=launch_setup)
     ])

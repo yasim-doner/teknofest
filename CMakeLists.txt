@@ -23,9 +23,10 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-# Install launch files
+# Install launch and params files
 install(DIRECTORY
   launch
+  params
   DESTINATION share/${PROJECT_NAME}
 )
 
