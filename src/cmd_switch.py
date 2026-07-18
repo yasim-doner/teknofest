@@ -20,6 +20,7 @@ class CmdSwitchNode(Node):
 
         # Mapping of stage ID to the source cmd_vel topic
         self.stage_topics = {
+            5: '/cone_avoid/cmd_vel',
             6: '/dynamic_obstacle/cmd_vel',
         }
 
@@ -28,6 +29,13 @@ class CmdSwitchNode(Node):
             Twist,
             '/fallow_corridor/cmd_vel',
             self.fallow_callback,
+            10
+        )
+
+        self.cone_sub = self.create_subscription(
+            Twist,
+            '/cone_avoid/cmd_vel',
+            self.cone_callback,
             10
         )
         
@@ -67,6 +75,11 @@ class CmdSwitchNode(Node):
     def fallow_callback(self, msg: Twist):
         # Route fallow_corridor if no specific stage node is active
         if self.active_stage not in self.stage_topics:
+            self.cmd_vel_pub.publish(msg)
+
+    def cone_callback(self, msg: Twist):
+        # Route cone_avoid only if Stage 5 is active
+        if self.active_stage == 5:
             self.cmd_vel_pub.publish(msg)
 
     def dynamic_callback(self, msg: Twist):

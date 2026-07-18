@@ -8,8 +8,35 @@ import cv2
 import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+
+class CvBridge:
+    def imgmsg_to_cv2(self, img_msg, desired_encoding="bgr8"):
+        if "8" in img_msg.encoding:
+            channels = 3
+            if "alpha" in img_msg.encoding or "a" in img_msg.encoding.lower():
+                channels = 4
+            frame = np.frombuffer(img_msg.data, dtype=np.uint8).reshape((img_msg.height, img_msg.width, channels)).copy()
+            if img_msg.encoding.startswith("rgb"):
+                if channels == 3:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                else:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGRA)
+            return frame
+        else:
+            raise ValueError(f"Unsupported encoding: {img_msg.encoding}")
+
+    def cv2_to_imgmsg(self, cv_img, encoding="bgr8"):
+        img_msg = Image()
+        img_msg.height = cv_img.shape[0]
+        img_msg.width = cv_img.shape[1]
+        img_msg.encoding = encoding
+        img_msg.is_bigendian = 0
+        img_msg.step = cv_img.shape[1] * cv_img.shape[2]
+        img_msg.data = cv_img.tobytes()
+        return img_msg
+
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32, Int32, String
 
@@ -131,19 +158,11 @@ class SignDetector(Node):
             Image,
             self.image_topic,
             self.image_callback,
-            10,
+            qos_profile_sensor_data,
         )
 
-        # Sign detector başladıktan sonra rqt_image_view
-        # penceresini otomatik açmak için kullanılır.
         self.image_viewer_process = None
-
-        # Gazebo ve kamera topic'lerinin oluşması için
-        # rqt_image_view iki saniye sonra açılır.
-        self.image_viewer_timer = self.create_timer(
-            2.0,
-            self.start_image_viewer,
-        )
+        self.image_viewer_timer = None
 
         self.get_logger().info(
             f"Sign detector başladı. "
@@ -1379,113 +1398,16 @@ class SignDetector(Node):
 
     def start_image_viewer(self):
         """
-        rqt_image_view penceresini yalnızca bir kere açar.
-
-        Açılan pencerede doğrudan
-        /teknofest/sign_debug_image topic'i gösterilir.
+        OpenCV penceresi kullanıldığı için bu metot artık pasiftir.
         """
-
-        # İki saniyelik timer yalnızca bir kere çalışsın.
-        if self.image_viewer_timer is not None:
-            self.image_viewer_timer.cancel()
-            self.image_viewer_timer = None
-
-        # Viewer zaten açıksa tekrar açma.
-        if (
-            self.image_viewer_process is not None
-            and self.image_viewer_process.poll() is None
-        ):
-            return
-
-        # Grafik ekranı bulunamazsa RQT açılamaz.
-        if not os.environ.get("DISPLAY"):
-            self.get_logger().warning(
-                "DISPLAY bulunamadı. "
-                "rqt_image_view açılamadı."
-            )
-            return
-
-        try:
-            self.image_viewer_process = subprocess.Popen(
-                [
-                    "ros2",
-                    "run",
-                    "rqt_image_view",
-                    "rqt_image_view",
-                    "/teknofest/sign_debug_image",
-                ],
-                start_new_session=True,
-            )
-
-            self.get_logger().info(
-                "rqt_image_view otomatik açıldı: "
-                "/teknofest/sign_debug_image"
-            )
-
-        except FileNotFoundError:
-            self.get_logger().error(
-                "ros2 komutu bulunamadı. "
-                "ROS 2 ortamının source edildiğini kontrol et."
-            )
-
-        except Exception as exc:
-            self.get_logger().error(
-                "rqt_image_view açılamadı: "
-                f"{exc}"
-            )
+        pass
 
     def stop_image_viewer(self):
         """
-        Sign detector kapanırken bu node tarafından açılan
-        rqt_image_view penceresini de kapatır.
+        Sign detector kapanırken OpenCV pencerelerini kapatır.
         """
+        cv2.destroyAllWindows()
 
-        if self.image_viewer_process is None:
-            return
-
-        if self.image_viewer_process.poll() is not None:
-            self.image_viewer_process = None
-            return
-
-        try:
-            process_group = os.getpgid(
-                self.image_viewer_process.pid
-            )
-
-            os.killpg(
-                process_group,
-                signal.SIGTERM,
-            )
-
-            self.image_viewer_process.wait(
-                timeout=3.0
-            )
-
-        except subprocess.TimeoutExpired:
-            try:
-                process_group = os.getpgid(
-                    self.image_viewer_process.pid
-                )
-
-                os.killpg(
-                    process_group,
-                    signal.SIGKILL,
-                )
-
-            except ProcessLookupError:
-                pass
-
-        except ProcessLookupError:
-            pass
-
-        except Exception as exc:
-            self.get_logger().warning(
-                "rqt_image_view kapatılırken "
-                f"hata oluştu: {exc}"
-            )
-
-        finally:
-            self.image_viewer_process = None
 
     def template_by_label(
         self,
@@ -1744,6 +1666,7 @@ class SignDetector(Node):
                 "Debug görüntüsü yayınlanamadı: "
                 f"{exc}"
             )
+
 
 
 def main(args=None):

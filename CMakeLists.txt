@@ -36,6 +36,7 @@ install(PROGRAMS
   src/dynamic_obstacle.py
   src/sign_detect.py
   src/cmd_switch.py
+  src/cone_avoid.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

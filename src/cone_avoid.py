@@ -6,6 +6,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Int32
@@ -93,14 +94,14 @@ class ConeAvoidNode(Node):
             PointCloud2,
             "/rover/points",
             self.pointcloud_callback,
-            10
+            qos_profile_sensor_data
         )
 
         self.imu_sub = self.create_subscription(
             Imu,
             "/rover/imu",
             self.imu_callback,
-            10
+            qos_profile_sensor_data
         )
 
         self.stage_sub = self.create_subscription(
@@ -112,7 +113,7 @@ class ConeAvoidNode(Node):
 
         self.cmd_vel_pub = self.create_publisher(
             Twist,
-            "/rover/cmd_vel",
+            "/cone_avoid/cmd_vel",
             10
         )
 
@@ -121,7 +122,7 @@ class ConeAvoidNode(Node):
         self.get_logger().info("Abone: /rover/points")
         self.get_logger().info("Abone: /rover/imu")
         self.get_logger().info("Abone: /teknofest/stage_id")
-        self.get_logger().info("Yayın: /rover/cmd_vel")
+        self.get_logger().info("Yayın: /cone_avoid/cmd_vel")
 
         if self.current_stage == 5:
             self.get_logger().info("Stage 5 aktif: cone_avoid kontrolü aldı.")
@@ -138,14 +139,13 @@ class ConeAvoidNode(Node):
             return
 
         # Stage numarasının yanlış algılanıp ileri atlamasını engeller.
-        # Örneğin Stage 5'te tabela yanlışlıkla 8 algılanırsa kabul edilmez.
-        if self.current_stage > 0 and detected_stage != self.current_stage + 1:
-            self.get_logger().info(
-                f"Stage {detected_stage} algılandı fakat beklenen "
-                f"Stage {self.current_stage + 1}; geçiş kabul edilmedi.",
-                throttle_duration_sec=2.0
-            )
-            return
+        # Cone avoid yalnızca Stage 5'e geçişi (aktivasyon) ve Stage 6'ya geçişi (deaktivasyon) bekler.
+        if self.current_stage < 5:
+            if detected_stage != 5:
+                return
+        elif self.current_stage == 5:
+            if detected_stage != 6:
+                return
 
         old_stage = self.current_stage
         self.current_stage = detected_stage

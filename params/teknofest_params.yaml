@@ -2,7 +2,7 @@
 
 fallow_corridor:
   ros__parameters:
-    target_speed: 0.25
+    target_speed: 0.2
     min_speed: 0.05
     max_angular_speed: 0.4
     kp_center: 0.8
@@ -20,6 +20,39 @@ fallow_corridor:
     front_obstacle_dist: 1.8
     front_stop_dist: 0.65
     min_points_threshold: 15
+
+cone_avoid:
+  ros__parameters:
+    initial_stage: 5
+    target_speed: 0.18
+    slow_speed: 0.07
+    kp_lateral: 1.30
+    kp_heading: 0.55
+    max_angular_speed: 0.50
+    hard_turn_speed: 0.50
+    smoothing_alpha: 0.45
+    lookahead_min_x: 0.15
+    lookahead_max_x: 3.00
+    crop_half_width: 1.80
+    crop_min_z: -0.65
+    crop_max_z: 0.75
+    ground_grid_size: 0.20
+    min_height_diff: 0.10
+    cluster_cell_size: 0.18
+    cone_min_points: 5
+    cone_max_width: 0.95
+    cone_max_depth: 0.95
+    cone_detect_distance: 2.50
+    cone_search_half_width: 1.40
+    pair_max_x_gap: 1.25
+    safe_lateral_clearance: 0.80
+    collision_half_width: 0.62
+    max_target_offset: 0.65
+    danger_distance: 1.00
+    default_avoid_side: -1
+    emergency_distance: 0.65
+    emergency_half_width: 0.62
+    emergency_min_points: 3
 
 dynamic_obstacle:
   ros__parameters:

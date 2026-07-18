@@ -1,4 +1,5 @@
 import os
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -71,6 +72,11 @@ def launch_setup(context, *args, **kwargs):
             'initial_yaw': yaw_val
         }.items()
     )
+    params_file_path = os.path.join(
+        get_package_share_directory('teknofest'),
+        'params',
+        'teknofest_params.yaml'
+    )
 
     # Corridor Follower Node
     fallow_corridor_node = Node(
@@ -79,9 +85,11 @@ def launch_setup(context, *args, **kwargs):
         name='fallow_corridor',
         output='screen',
         parameters=[
+            params_file_path,
             {'use_sim_time': True,
-            'initial_stage': stage}
-        ]
+             'initial_stage': stage}
+        ],
+        arguments=['--ros-args', '--log-level', 'warn']
     )
 
     # Cone Avoid Node
@@ -91,34 +99,22 @@ def launch_setup(context, *args, **kwargs):
         name='cone_avoid',
         output='screen',
         parameters=[
+            params_file_path,
             {'use_sim_time': True,
-            'initial_stage': stage}
+             'initial_stage': stage}
         ]
     )
-
-    # Stage 5'te cone avoid, diğer stage'lerde fallow corridor
-    if stage == 5:
-        movement_node = cone_avoid_node
-
-        print(
-            "\n[sim.launch.py] "
-            "Stage 5 selected: cone_avoid.py is starting.\n"
-        )
-
-    else:
-        movement_node = fallow_corridor_node
-
-        print(
-            f"\n[sim.launch.py] "
-            f"Stage {stage} selected: fallow_corridor.py is starting.\n"
-        )
 
     # Dynamic Obstacle Node
     dynamic_obstacle_node = Node(
         package='teknofest',
         executable='dynamic_obstacle.py',
         name='dynamic_obstacle',
-        output='screen'
+        output='screen',
+        parameters=[
+            params_file_path,
+            {'use_sim_time': True}
+        ]
     )
 
     # Sign Detector Node
@@ -128,16 +124,49 @@ def launch_setup(context, *args, **kwargs):
         name='sign_detect',
         output='screen',
         parameters=[
+            params_file_path,
             {'use_sim_time': True}
         ]
+    )
+
+    # Command Switch Node
+    cmd_switch_node = Node(
+        package='teknofest',
+        executable='cmd_switch.py',
+        name='cmd_switch',
+        output='screen',
+        parameters=[
+            params_file_path,
+            {'use_sim_time': True}
+        ]
+    )
+
+    # RViz2 Node
+    rviz_config_path = os.path.join(
+        get_package_share_directory('teknofest'),
+        'params',
+        'tekno.rviz'
+    )
+
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config_path],
+        parameters=[
+            {'use_sim_time': True}
+        ],
+        output='screen'
     )
 
     return [
         include_rover_sim_gazebo,
         fallow_corridor_node,
-        movement_node,
-        # dynamic_obstacle_node,
-        sign_detect_node
+        cone_avoid_node,
+        dynamic_obstacle_node,
+        sign_detect_node,
+        cmd_switch_node,
+        rviz_node
     ]
 
 def generate_launch_description():

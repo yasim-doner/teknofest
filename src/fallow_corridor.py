@@ -18,7 +18,7 @@ class FallowCorridorNode(Node):
         super().__init__('fallow_corridor')
 
         # Declare parameters for tuning on the fly (open-loop motor coefficients)
-        self.declare_parameter('target_speed', 0.25)           # Target forward speed (motor power: 0.0 to 1.0)
+        self.declare_parameter('target_speed', 0.2)           # Target forward speed (motor power: 0.0 to 1.0)
         self.declare_parameter('min_speed', 0.05)              # Minimum forward speed (motor power: 0.0 to 1.0)
         self.declare_parameter('max_angular_speed', 0.4)       # Maximum steering command limit (motor power limit)
         self.declare_parameter('kp_center', 0.8)               # Proportional gain for centering (error -> steering power)
