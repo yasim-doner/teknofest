@@ -33,6 +33,7 @@ install(DIRECTORY
 install(PROGRAMS
   src/fallow_corridor.py
   src/dynamic_obstacle.py
+  src/sign_detect.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

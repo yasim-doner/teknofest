@@ -77,10 +77,19 @@ def launch_setup(context, *args, **kwargs):
         output='screen'
     )
 
+    # Sign Detector Node
+    sign_detect_node = Node(
+        package='teknofest',
+        executable='sign_detect.py',
+        name='sign_detect',
+        output='screen'
+    )
+
     return [
         include_rover_sim_gazebo,
-        # fallow_corridor_node,
-        dynamic_obstacle_node
+        fallow_corridor_node,
+        #dynamic_obstacle_node,
+        sign_detect_node
     ]
 
 def generate_launch_description():
