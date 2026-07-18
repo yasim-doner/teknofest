@@ -66,7 +66,8 @@ def launch_setup(context, *args, **kwargs):
         package='teknofest',
         executable='fallow_corridor.py',
         name='fallow_corridor',
-        output='screen'
+        output='screen',
+        arguments=['--ros-args', '--log-level', 'warn']
     )
 
     # Dynamic Obstacle Node
@@ -85,11 +86,20 @@ def launch_setup(context, *args, **kwargs):
         output='screen'
     )
 
+    # Command Switch Node
+    cmd_switch_node = Node(
+        package='teknofest',
+        executable='cmd_switch.py',
+        name='cmd_switch',
+        output='screen'
+    )
+
     return [
         include_rover_sim_gazebo,
         fallow_corridor_node,
-        #dynamic_obstacle_node,
-        sign_detect_node
+        dynamic_obstacle_node,
+        sign_detect_node,
+        cmd_switch_node
     ]
 
 def generate_launch_description():

@@ -6,6 +6,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
+from std_msgs.msg import Int32
 
 class DynamicObstacleNode(Node):
     """
@@ -28,6 +29,11 @@ class DynamicObstacleNode(Node):
         self.declare_parameter('grid_cell_size', 0.2)          # Grid size for local ground estimation (meters)
         self.declare_parameter('min_height_diff', 0.18)        # Height threshold above ground to count as obstacle (meters)
         self.declare_parameter('min_points_threshold', 15)     # Min points to consider obstacle present
+        self.declare_parameter('crossing_duration', 4.0)       # Seconds to move forward after obstacle clears
+
+        # State variables for activation and passing
+        self.is_active = False
+        self.clear_start_time = None
 
         # Subscriptions & Publishers
         self.points_sub = self.create_subscription(
@@ -36,17 +42,38 @@ class DynamicObstacleNode(Node):
             self.pointcloud_callback,
             10
         )
+        self.stage_sub = self.create_subscription(
+            Int32,
+            '/teknofest/stage_id',
+            self.stage_callback,
+            10
+        )
         self.cmd_vel_pub = self.create_publisher(
             Twist,
-            '/rover/cmd_vel',
+            '/dynamic_obstacle/cmd_vel',
+            10
+        )
+        self.release_pub = self.create_publisher(
+            Int32,
+            '/teknofest/release',
             10
         )
 
         self.get_logger().info("=== Dynamic Obstacle Node Initialized ===")
-        self.get_logger().info("Subscribed to /rover/points")
-        self.get_logger().info("Publishing to /rover/cmd_vel")
+        self.get_logger().info("Subscribed to /rover/points and /teknofest/stage_id")
+        self.get_logger().info("Publishing to /dynamic_obstacle/cmd_vel and /teknofest/release")
+
+    def stage_callback(self, msg: Int32):
+        if msg.data == 6:
+            if not self.is_active:
+                self.is_active = True
+                self.clear_start_time = None
+                self.get_logger().info("Dynamic obstacle node ACTIVATED for Stage 6.")
 
     def pointcloud_callback(self, msg: PointCloud2):
+        if not self.is_active:
+            return
+
         # Read parameters
         target_speed = self.get_parameter('target_speed').value
         detection_min_x = self.get_parameter('detection_min_x').value
@@ -57,6 +84,32 @@ class DynamicObstacleNode(Node):
         grid_cell_size = self.get_parameter('grid_cell_size').value
         min_height_diff = self.get_parameter('min_height_diff').value
         min_points_threshold = self.get_parameter('min_points_threshold').value
+        crossing_duration = self.get_parameter('crossing_duration').value
+
+        # If we have already started crossing, drive forward and check timer
+        if self.clear_start_time is not None:
+            elapsed = (self.get_clock().now() - self.clear_start_time).nanoseconds / 1e9
+            if elapsed < crossing_duration:
+                cmd_msg = Twist()
+                cmd_msg.linear.x = float(target_speed)
+                cmd_msg.angular.z = 0.0
+                self.cmd_vel_pub.publish(cmd_msg)
+                self.get_logger().info(f"[CROSSING] Elapsed: {elapsed:.2f}s / {crossing_duration:.2f}s", throttle_duration_sec=0.5)
+                return
+            else:
+                # Finished crossing! Release control.
+                self.get_logger().info("Crossing completed. Releasing control back to fallow_corridor.")
+                
+                # Publish release message
+                release_msg = Int32()
+                release_msg.data = 6
+                self.release_pub.publish(release_msg)
+                
+                # Stop robot and reset state
+                self.stop_robot()
+                self.is_active = False
+                self.clear_start_time = None
+                return
 
         # Unpack PointCloud2 data
         try:
@@ -99,15 +152,23 @@ class DynamicObstacleNode(Node):
         if obstacle_detected:
             linear_x = 0.0
             status_msg = f"WAITING (Obstacle detected: {len(obstacle_pts)} pts)"
+            
+            # Publish velocities (stop)
+            cmd_msg = Twist()
+            cmd_msg.linear.x = 0.0
+            cmd_msg.angular.z = 0.0
+            self.cmd_vel_pub.publish(cmd_msg)
         else:
+            # Obstacle cleared, start the crossing timer
+            self.clear_start_time = self.get_clock().now()
             linear_x = target_speed
-            status_msg = f"MOVING CLEAR (Obstacle points: {len(obstacle_pts)} pts)"
-
-        # Publish velocities (straight forward, no rotation)
-        cmd_msg = Twist()
-        cmd_msg.linear.x = float(linear_x)
-        cmd_msg.angular.z = 0.0
-        self.cmd_vel_pub.publish(cmd_msg)
+            status_msg = f"MOVING CLEAR - START TIMER (Obstacle points: {len(obstacle_pts)} pts)"
+            
+            # Publish velocities
+            cmd_msg = Twist()
+            cmd_msg.linear.x = float(linear_x)
+            cmd_msg.angular.z = 0.0
+            self.cmd_vel_pub.publish(cmd_msg)
 
         # Log status
         self.get_logger().info(

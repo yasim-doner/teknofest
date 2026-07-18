@@ -34,6 +34,7 @@ install(PROGRAMS
   src/fallow_corridor.py
   src/dynamic_obstacle.py
   src/sign_detect.py
+  src/cmd_switch.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

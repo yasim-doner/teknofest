@@ -64,13 +64,13 @@ class FallowCorridorNode(Node):
         )
         self.cmd_vel_pub = self.create_publisher(
             Twist,
-            '/rover/cmd_vel',
+            '/fallow_corridor/cmd_vel',
             10
         )
 
         self.get_logger().info("=== Fallow Corridor Node Initialized ===")
         self.get_logger().info("Subscribed to /rover/points and /rover/imu")
-        self.get_logger().info("Publishing to /rover/cmd_vel")
+        self.get_logger().info("Publishing to /fallow_corridor/cmd_vel")
 
     def imu_callback(self, msg: Imu):
         x = msg.orientation.x
