@@ -25,9 +25,10 @@ SIGN_POSES = {
 def launch_setup(context, *args, **kwargs):
     # Retrieve configurations
     stage_val = context.launch_configurations.get('stage', '0')
-    use_sim_time_val = context.launch_configurations.get('use_sim_time', 'true')
-    use_sim_time_bool = use_sim_time_val.lower() == 'true'
-    
+
+    # Stage değeri dönüştürülemezse kullanılacak varsayılan değer
+    stage = 0
+
     # Defaults
     x_val = context.launch_configurations.get('initial_x', '17.5')
     y_val = context.launch_configurations.get('initial_y', '0.0')
@@ -37,15 +38,23 @@ def launch_setup(context, *args, **kwargs):
     # If stage is selected (1 to 11), override defaults with the sign start pose
     try:
         stage = int(stage_val)
+
         if stage in SIGN_POSES:
             px, py, pz, pyaw = SIGN_POSES[stage]
+
             x_val = str(px)
             y_val = str(py)
             z_val = str(pz)
             yaw_val = str(pyaw)
-            print(f"\n[sim.launch.py] Spawning at Stage {stage} Start: X={x_val}, Y={y_val}, Yaw={yaw_val}\n")
-    except ValueError:
-        pass
+
+            print(
+                f"\n[sim.launch.py] "
+                f"Spawning at Stage {stage} Start: "
+                f"X={x_val}, Y={y_val}, Yaw={yaw_val}\n"
+            )
+
+    except (ValueError, TypeError):
+        stage = 0
 
     rover_sim_launch_path = PathJoinSubstitution([
         FindPackageShare('rover_sim'),
@@ -59,16 +68,9 @@ def launch_setup(context, *args, **kwargs):
             'initial_x': x_val,
             'initial_y': y_val,
             'initial_z': z_val,
-            'initial_yaw': yaw_val,
-            'use_sim_time': use_sim_time_val
+            'initial_yaw': yaw_val
         }.items()
     )
-
-    teknofest_params_path = PathJoinSubstitution([
-        FindPackageShare('teknofest'),
-        'params',
-        'teknofest_params.yaml'
-    ])
 
     # Corridor Follower Node
     fallow_corridor_node = Node(
@@ -76,17 +78,47 @@ def launch_setup(context, *args, **kwargs):
         executable='fallow_corridor.py',
         name='fallow_corridor',
         output='screen',
-        parameters=[teknofest_params_path, {'use_sim_time': use_sim_time_bool}],
-        arguments=['--ros-args', '--log-level', 'warn']
+        parameters=[
+            {'use_sim_time': True,
+            'initial_stage': stage}
+        ]
     )
+
+    # Cone Avoid Node
+    cone_avoid_node = Node(
+        package='teknofest',
+        executable='cone_avoid.py',
+        name='cone_avoid',
+        output='screen',
+        parameters=[
+            {'use_sim_time': True,
+            'initial_stage': stage}
+        ]
+    )
+
+    # Stage 5'te cone avoid, diğer stage'lerde fallow corridor
+    if stage == 5:
+        movement_node = cone_avoid_node
+
+        print(
+            "\n[sim.launch.py] "
+            "Stage 5 selected: cone_avoid.py is starting.\n"
+        )
+
+    else:
+        movement_node = fallow_corridor_node
+
+        print(
+            f"\n[sim.launch.py] "
+            f"Stage {stage} selected: fallow_corridor.py is starting.\n"
+        )
 
     # Dynamic Obstacle Node
     dynamic_obstacle_node = Node(
         package='teknofest',
         executable='dynamic_obstacle.py',
         name='dynamic_obstacle',
-        output='screen',
-        parameters=[teknofest_params_path, {'use_sim_time': use_sim_time_bool}]
+        output='screen'
     )
 
     # Sign Detector Node
@@ -95,24 +127,17 @@ def launch_setup(context, *args, **kwargs):
         executable='sign_detect.py',
         name='sign_detect',
         output='screen',
-        parameters=[teknofest_params_path, {'use_sim_time': use_sim_time_bool}]
-    )
-
-    # Command Switch Node
-    cmd_switch_node = Node(
-        package='teknofest',
-        executable='cmd_switch.py',
-        name='cmd_switch',
-        output='screen',
-        parameters=[{'use_sim_time': use_sim_time_bool}]
+        parameters=[
+            {'use_sim_time': True}
+        ]
     )
 
     return [
         include_rover_sim_gazebo,
         fallow_corridor_node,
-        dynamic_obstacle_node,
-        sign_detect_node,
-        cmd_switch_node
+        movement_node,
+        # dynamic_obstacle_node,
+        sign_detect_node
     ]
 
 def generate_launch_description():
@@ -147,18 +172,11 @@ def generate_launch_description():
         description="Yaw rotation where rover would be spawned"
     )
 
-    use_sim_time_arg = DeclareLaunchArgument(
-        name="use_sim_time",
-        default_value="true",
-        description="Use simulation (Gazebo) clock if true"
-    )
-
     return LaunchDescription([
         stage_arg,
         x_arg,
         y_arg,
         z_arg,
         yaw_arg,
-        use_sim_time_arg,
         OpaqueFunction(function=launch_setup)
     ])
