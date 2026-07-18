@@ -33,3 +33,15 @@ ros2 launch teknofest gazebo.launch.py
 ```
 
 This launch file includes and executes the underlying Gazebo simulator defined in the `rover_sim` package, with automatic argument forwarding.
+
+## Corridor Follower Node
+
+To run the corridor following node:
+
+```bash
+ros2 run teknofest fallow_corridor.py
+```
+
+> [!NOTE]
+> **Open-Loop Control Note:** The simulation robot operates in an open-loop configuration. Commands sent to `/rover/cmd_vel` represent raw motor power coefficients (ranging between `-1.0` and `1.0`) rather than physical velocities in meters/second or radians/second. Default parameters (such as `target_speed = 0.25` and `max_angular_speed = 0.4`) have been adjusted and clamped to prevent unstable steering or excessive speed.
+

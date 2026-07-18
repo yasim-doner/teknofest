@@ -29,5 +29,12 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
+# Install python scripts
+install(PROGRAMS
+  src/fallow_corridor.py
+  src/dynamic_obstacle.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
 
