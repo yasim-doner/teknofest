@@ -13,6 +13,8 @@ from std_msgs.msg import Bool, Int32, String
 class LaserTaskState(Enum):
     WAIT_STAGE = auto()
     APPROACH_RAMP = auto()
+    CREEP_ON_RAMP = auto()
+    PAUSE_ON_RAMP = auto()
     ASCENDING_RAMP = auto()
     SEARCH_STOP = auto()
     STOPPING = auto()
@@ -27,12 +29,15 @@ class LaserTarget(Node):
     Çalışma sırası:
     1. /teknofest/stage_id == 8 olana kadar bekler.
     2. IMU pitch açısıyla rampaya çıkıldığını anlar.
-    3. Rampadan sonra zemin yeniden düzleşince yavaşlar.
-    4. STOP tabelası görülürse hemen; görülmezse kısa güvenlik süresi
+    3. Rampanın biraz içerisine kontrollü biçimde ilerler.
+    4. Rampa üzerinde 2 saniye tamamen hareketsiz bekler.
+    5. Bekleme bitince rampayı çıkmaya devam eder.
+    6. Rampadan sonra zemin yeniden düzleşince yavaşlar.
+    6. STOP tabelası görülürse hemen; görülmezse kısa güvenlik süresi
        sonunda roverı durdurur.
-    5. Roverı en az 2 saniye tamamen durdurur.
-    6. Lazeri en az 1 saniye açık tutar.
-    7. /teknofest/laser_complete = True yayınlar.
+    7. Roverı en az 2 saniye tamamen durdurur.
+    8. Lazeri en az 1 saniye açık tutar.
+    9. /teknofest/laser_complete = True yayınlar.
 
     Not:
     - Bu node lazerin Gazebo'daki görselini kendisi oluşturmaz.
@@ -52,6 +57,9 @@ class LaserTarget(Node):
         self.declare_parameter("ramp_speed", 0.45)
         self.declare_parameter("ramp_boost_speed", 0.55)
         self.declare_parameter("ramp_boost_delay", 2.0)
+        self.declare_parameter("ramp_pause_duration", 2.0)
+        self.declare_parameter("ramp_creep_duration", 0.8)
+        self.declare_parameter("ramp_creep_speed", 0.25)
         self.declare_parameter("search_speed", 0.08)
 
         self.declare_parameter("ramp_pitch_threshold_deg", 8.0)
@@ -75,6 +83,18 @@ class LaserTarget(Node):
         self.ramp_boost_delay = max(
             0.0,
             float(self.get_parameter("ramp_boost_delay").value),
+        )
+        self.ramp_pause_duration = max(
+            0.0,
+            float(self.get_parameter("ramp_pause_duration").value),
+        )
+        self.ramp_creep_duration = max(
+            0.0,
+            float(self.get_parameter("ramp_creep_duration").value),
+        )
+        self.ramp_creep_speed = max(
+            0.0,
+            float(self.get_parameter("ramp_creep_speed").value),
         )
         self.search_speed = float(self.get_parameter("search_speed").value)
 
@@ -179,6 +199,9 @@ class LaserTarget(Node):
         self.get_logger().info(
             f"Aktif stage={self.active_stage}, "
             f"başlangıç stage={self.current_stage}, "
+            f"rampa_ileri={self.ramp_creep_duration:.1f}s/"
+            f"{self.ramp_creep_speed:.2f}m/s, "
+            f"rampa_bekleme={self.ramp_pause_duration:.1f}s, "
             f"durma={self.stop_duration:.1f}s, "
             f"lazer={self.laser_duration:.1f}s"
         )
@@ -324,9 +347,50 @@ class LaserTarget(Node):
             self.publish_velocity(linear_x=self.approach_speed)
 
             if self.ramp_frame_count >= self.ramp_confirm_frames:
+                self.set_state(LaserTaskState.CREEP_ON_RAMP)
+                self.get_logger().warning(
+                    f"Rampa algılandı. "
+                    f"Pitch={math.degrees(self.pitch):.1f} derece. "
+                    f"Rover önce {self.ramp_creep_duration:.1f} saniye "
+                    f"{self.ramp_creep_speed:.2f} m/s ile biraz daha çıkacak."
+                )
+
+        elif self.state == LaserTaskState.CREEP_ON_RAMP:
+            self.publish_laser(False)
+
+            # Eğim algılanır algılanmaz durmak yerine rampanın biraz
+            # içerisine gir. Böylece rover rampanın tam başlangıcında kalmaz.
+            self.publish_velocity(
+                linear_x=self.ramp_creep_speed,
+                angular_z=0.0,
+            )
+
+            if self.elapsed_in_state() >= self.ramp_creep_duration:
+                self.set_state(LaserTaskState.PAUSE_ON_RAMP)
+                self.get_logger().warning(
+                    "Rampada kısa ilerleme tamamlandı. "
+                    f"Rover şimdi {self.ramp_pause_duration:.1f} saniye "
+                    "hareketsiz bekleyecek."
+                )
+
+        elif self.state == LaserTaskState.PAUSE_ON_RAMP:
+            self.publish_laser(False)
+
+            # Rampada tam hareketsiz bekle.
+            self.publish_velocity(
+                linear_x=0.0,
+                angular_z=0.0,
+            )
+
+            if self.elapsed_in_state() >= self.ramp_pause_duration:
+                self.ramp_frame_count = 0
+                self.flat_frame_count = 0
+                self.last_ramp_log_time = -1000.0
+
                 self.set_state(LaserTaskState.ASCENDING_RAMP)
-                self.get_logger().info(
-                    f"Rampa algılandı. Pitch={math.degrees(self.pitch):.1f} derece"
+                self.get_logger().warning(
+                    f"Rampadaki {self.ramp_pause_duration:.1f} saniyelik "
+                    "bekleme tamamlandı. Rover rampayı çıkmaya devam ediyor."
                 )
 
         elif self.state == LaserTaskState.ASCENDING_RAMP:
