@@ -1,1687 +1,1378 @@
 #!/usr/bin/env python3
 
-import os
-import signal
-import subprocess
+import math
+import time
 
 import cv2
 import numpy as np
 import rclpy
-from ament_index_python.packages import get_package_share_directory
+from cv_bridge import CvBridge
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-
-class CvBridge:
-    def imgmsg_to_cv2(self, img_msg, desired_encoding="bgr8"):
-        if "8" in img_msg.encoding:
-            channels = 3
-            if "alpha" in img_msg.encoding or "a" in img_msg.encoding.lower():
-                channels = 4
-            frame = np.frombuffer(img_msg.data, dtype=np.uint8).reshape((img_msg.height, img_msg.width, channels)).copy()
-            if img_msg.encoding.startswith("rgb"):
-                if channels == 3:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                else:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGRA)
-            return frame
-        else:
-            raise ValueError(f"Unsupported encoding: {img_msg.encoding}")
-
-    def cv2_to_imgmsg(self, cv_img, encoding="bgr8"):
-        img_msg = Image()
-        img_msg.height = cv_img.shape[0]
-        img_msg.width = cv_img.shape[1]
-        img_msg.encoding = encoding
-        img_msg.is_bigendian = 0
-        img_msg.step = cv_img.shape[1] * cv_img.shape[2]
-        img_msg.data = cv_img.tobytes()
-        return img_msg
-
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32, Int32, String
 
 
 class SignDetector(Node):
+    # sim.launch.py içindeki stage başlangıç konumları.
+    STAGE_POSITIONS = {
+        1: (16.0, 0.0),
+        2: (11.0, 0.0),
+        3: (6.0, 0.0),
+        4: (2.0, 10.0),
+        5: (7.0, 10.0),
+        6: (14.0, 10.0),
+        7: (18.0, 20.0),
+        8: (11.5, 20.0),
+        9: (7.8, 20.0),
+        10: (4.8, 20.0),
+        11: (20.0, -8.0),
+    }
+
     """
-    Gazebo TEKNOFEST etap tabelalarını algılar.
+    Teknofest parkurundaki kırmızı çerçeveli fiziksel levhaları sırasıyla sayar.
 
-    Çalışma sırası:
-    1. Beyaz içli, kırmızı çerçeveli, yaklaşık dairesel tabela adaylarını bulur.
-    2. Birden fazla aday varsa her birini sınıflandırır.
-    3. Dış çerçeve yerine tabelanın ortasındaki rakam/yazıyı karşılaştırır.
-    4. En iyi ve ikinci en iyi sınıf arasındaki fark yeterliyse sonucu kabul eder.
-    5. Aynı etiket art arda birkaç kare görülmeden kararlı sonuç yayınlamaz.
-
-    Bu node yalnızca algılama yapar; /rover/cmd_vel yayınlamaz.
-    Parkur sırası denetimi ayrı bir mission_manager node'unda yapılmalıdır.
+    Bu sürüm:
+    - worker thread kullanmaz,
+    - template matching kullanmaz,
+    - HoughCircles kullanmaz,
+    - her kamera karesini hızlı connected-components yöntemiyle işler,
+    - ilk fiziksel levhayı stage_1, sonrakileri stage_2... olarak yayınlar,
+    - Stage 8 sonrasında görülen sonraki yakın levhayı STOP olarak yayınlar.
     """
 
     def __init__(self):
-        super().__init__("sign_detector")
+        super().__init__("sign_detect")
 
         self.declare_parameter(
             "image_topic",
-            "/rover/camera/image_raw"
+            "/rover/camera/image_raw",
         )
-        self.declare_parameter("min_confidence", 0.18)
-        self.declare_parameter("min_margin", 0.015)
-        self.declare_parameter("stable_frames", 3)
-        self.declare_parameter("lost_frames", 5)
-        self.declare_parameter("min_candidate_size", 12)
-        self.declare_parameter("max_candidate_size", 60)
-        self.declare_parameter("max_candidates", 5)
+        self.declare_parameter("initial_stage", 0)
+
+        self.declare_parameter("min_component_area", 30)
+        self.declare_parameter("max_component_area_ratio", 0.15)
+        self.declare_parameter("min_candidate_size", 8)
+        self.declare_parameter("max_candidate_size", 220)
+
+        self.declare_parameter("min_aspect", 0.45)
+        self.declare_parameter("max_aspect", 1.75)
+        self.declare_parameter("min_white_ratio", 0.08)
+        self.declare_parameter("min_red_fill_ratio", 0.02)
+
+        self.declare_parameter("enter_radius", 14)
+        self.declare_parameter("exit_radius", 9)
+        self.declare_parameter("enter_frames", 2)
+        self.declare_parameter("exit_frames", 3)
+
+        self.declare_parameter("stop_guard_seconds", 3.0)
+        self.declare_parameter("diagnostic_every_frames", 5)
+        self.declare_parameter("min_stage_travel_distance", 1.5)
+        self.declare_parameter("min_stage_interval_seconds", 2.0)
+        self.declare_parameter("use_stage_geofence", True)
+        self.declare_parameter("stage_geofence_radius", 3.0)
+        self.declare_parameter("final_stage", 10)
+        self.declare_parameter("stop_after_final_stage", True)
+
+        # Görüntünün alt kısmındaki koniler stage levhası değildir.
+        self.declare_parameter("max_stage_candidate_y_ratio", 0.78)
+        self.declare_parameter("upper_enter_radius", 10)
+
+        # Simülasyon yedeği: bir levha kaçarsa stage sırası kaymasın.
+        self.declare_parameter("use_odom_fallback", True)
+        self.declare_parameter("stage5_to6_x", 12.5)
+        self.declare_parameter("stage5_lane_y", 10.0)
+        self.declare_parameter("stage5_lane_tolerance", 3.0)
+        self.declare_parameter("stage6_to7_min_x", 15.0)
+        self.declare_parameter("stage6_to7_y", 17.0)
 
         self.image_topic = str(
             self.get_parameter("image_topic").value
         )
-
-        self.min_confidence = float(
-            self.get_parameter("min_confidence").value
+        self.initial_stage = max(
+            0,
+            min(
+                11,
+                int(
+                    self.get_parameter(
+                        "initial_stage"
+                    ).value
+                ),
+            ),
         )
 
-        self.min_margin = float(
-            self.get_parameter("min_margin").value
-        )
-
-        self.stable_frames = max(
+        self.min_component_area = max(
             1,
-            int(self.get_parameter("stable_frames").value)
+            int(
+                self.get_parameter(
+                    "min_component_area"
+                ).value
+            ),
         )
-
-        self.lost_frames_limit = max(
-            1,
-            int(self.get_parameter("lost_frames").value)
+        self.max_component_area_ratio = float(
+            self.get_parameter(
+                "max_component_area_ratio"
+            ).value
         )
-
         self.min_candidate_size = max(
-            6,
-            int(self.get_parameter("min_candidate_size").value)
+            2,
+            int(
+                self.get_parameter(
+                    "min_candidate_size"
+                ).value
+            ),
         )
-
         self.max_candidate_size = max(
             self.min_candidate_size + 1,
-            int(self.get_parameter("max_candidate_size").value),
+            int(
+                self.get_parameter(
+                    "max_candidate_size"
+                ).value
+            ),
         )
 
-        self.max_candidates = max(
+        self.min_aspect = float(
+            self.get_parameter("min_aspect").value
+        )
+        self.max_aspect = float(
+            self.get_parameter("max_aspect").value
+        )
+        self.min_white_ratio = float(
+            self.get_parameter(
+                "min_white_ratio"
+            ).value
+        )
+        self.min_red_fill_ratio = float(
+            self.get_parameter(
+                "min_red_fill_ratio"
+            ).value
+        )
+
+        self.enter_radius = max(
             1,
-            int(self.get_parameter("max_candidates").value)
+            int(
+                self.get_parameter(
+                    "enter_radius"
+                ).value
+            ),
+        )
+        self.exit_radius = max(
+            1,
+            int(
+                self.get_parameter(
+                    "exit_radius"
+                ).value
+            ),
+        )
+        self.enter_frames = max(
+            1,
+            int(
+                self.get_parameter(
+                    "enter_frames"
+                ).value
+            ),
+        )
+        self.exit_frames = max(
+            1,
+            int(
+                self.get_parameter(
+                    "exit_frames"
+                ).value
+            ),
+        )
+
+        self.stop_guard_seconds = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "stop_guard_seconds"
+                ).value
+            ),
+        )
+        self.diagnostic_every_frames = max(
+            1,
+            int(
+                self.get_parameter(
+                    "diagnostic_every_frames"
+                ).value
+            ),
+        )
+
+        self.min_stage_travel_distance = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "min_stage_travel_distance"
+                ).value
+            ),
+        )
+        self.min_stage_interval_seconds = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "min_stage_interval_seconds"
+                ).value
+            ),
+        )
+
+        self.use_stage_geofence = bool(
+            self.get_parameter(
+                "use_stage_geofence"
+            ).value
+        )
+        self.stage_geofence_radius = max(
+            0.5,
+            float(
+                self.get_parameter(
+                    "stage_geofence_radius"
+                ).value
+            ),
+        )
+
+        self.final_stage = max(
+            1,
+            min(
+                11,
+                int(
+                    self.get_parameter(
+                        "final_stage"
+                    ).value
+                ),
+            ),
+        )
+        self.stop_after_final_stage = bool(
+            self.get_parameter(
+                "stop_after_final_stage"
+            ).value
+        )
+
+        self.max_stage_candidate_y_ratio = float(
+            self.get_parameter(
+                "max_stage_candidate_y_ratio"
+            ).value
+        )
+        self.upper_enter_radius = max(
+            1,
+            int(
+                self.get_parameter(
+                    "upper_enter_radius"
+                ).value
+            ),
+        )
+
+        self.use_odom_fallback = bool(
+            self.get_parameter(
+                "use_odom_fallback"
+            ).value
+        )
+        self.stage5_to6_x = float(
+            self.get_parameter(
+                "stage5_to6_x"
+            ).value
+        )
+        self.stage5_lane_y = float(
+            self.get_parameter(
+                "stage5_lane_y"
+            ).value
+        )
+        self.stage5_lane_tolerance = max(
+            0.1,
+            float(
+                self.get_parameter(
+                    "stage5_lane_tolerance"
+                ).value
+            ),
+        )
+        self.stage6_to7_min_x = float(
+            self.get_parameter(
+                "stage6_to7_min_x"
+            ).value
+        )
+        self.stage6_to7_y = float(
+            self.get_parameter(
+                "stage6_to7_y"
+            ).value
         )
 
         self.bridge = CvBridge()
-        self.templates = self.load_templates()
 
-        if not self.templates:
-            raise RuntimeError(
-                "Hiç tabela şablonu yüklenemedi."
-            )
-
-        self.pending_label = None
-        self.pending_count = 0
-
-        self.stable_label = None
-        self.stable_confidence = 0.0
-
-        self.lost_frames = 0
-
-        self.stage_pub = self.create_publisher(
-            Int32,
-            "/teknofest/stage_id",
-            10
+        # Kamera publisher'ı RELIABLE olduğu için aynı QoS kullanılır.
+        self.camera_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
         )
 
-        self.stop_pub = self.create_publisher(
-            Bool,
-            "/teknofest/stop_detected",
-            10
-        )
-
-        self.label_pub = self.create_publisher(
-            String,
-            "/teknofest/sign_label",
-            10
-        )
-
-        self.conf_pub = self.create_publisher(
-            Float32,
-            "/teknofest/sign_confidence",
-            10
-        )
-
-        self.debug_pub = self.create_publisher(
-            Image,
-            "/teknofest/sign_debug_image",
-            10
+        self.debug_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
         )
 
         self.image_sub = self.create_subscription(
             Image,
             self.image_topic,
             self.image_callback,
-            qos_profile_sensor_data,
+            self.camera_qos,
         )
 
-        self.image_viewer_process = None
-        self.image_viewer_timer = None
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            "/rover/odom",
+            self.odom_callback,
+            10,
+        )
+
+        self.stage_pub = self.create_publisher(
+            Int32,
+            "/teknofest/stage_id",
+            10,
+        )
+        self.stage_order_pub = self.create_publisher(
+            Int32,
+            "/teknofest/stage_order",
+            10,
+        )
+        self.stop_pub = self.create_publisher(
+            Bool,
+            "/teknofest/stop_detected",
+            10,
+        )
+
+        self.final_stop_pub = self.create_publisher(
+            Bool,
+            "/teknofest/final_stop",
+            10,
+        )
+        self.label_pub = self.create_publisher(
+            String,
+            "/teknofest/sign_label",
+            10,
+        )
+        self.confidence_pub = self.create_publisher(
+            Float32,
+            "/teknofest/sign_confidence",
+            10,
+        )
+        self.debug_pub = self.create_publisher(
+            Image,
+            "/teknofest/sign_debug_image",
+            self.debug_qos,
+        )
+
+        self.frame_count = 0
+        self.stage_id = self.initial_stage
+
+        # Normal başlangıçta ilk levhaya hazırız.
+        # stage:=8 doğrudan testinde mevcut stage tekrar artırılmasın.
+        self.encounter_active = self.initial_stage > 0
+        self.enter_count = 0
+        self.exit_count = 0
+
+        self.stop_active = False
+        self.stop_completed = False
+
+        # Stage 10 tabelası geride kaldığında kalıcı olarak True olur.
+        self.final_stop_active = False
+        self.stage8_started_at = (
+            self.now_seconds()
+            if self.stage_id == 8
+            else None
+        )
+
+        self.last_radius = 0
+        self.last_center = None
+        self.last_candidate_count = 0
+        self.last_red_pixels = 0
+        self.last_process_seconds = 0.0
+
+        # İlk kamera callback'inin gelip gelmediğini açıkça gösterir.
+        self.first_callback_seen = False
+
+        self.odom_x = None
+        self.odom_y = None
+        self.last_odom_fallback_stage = None
+
+        self.last_stage_change_x = None
+        self.last_stage_change_y = None
+        self.last_stage_change_time = None
+
+        self.publish_state()
 
         self.get_logger().info(
-            f"Sign detector başladı. "
+            "=== Basit ve hızlı tabela algılayıcı başladı ==="
+        )
+        self.get_logger().info(
             f"Kamera={self.image_topic}, "
-            f"şablon={len(self.templates)}, "
-            f"eşik={self.min_confidence:.3f}, "
-            f"fark_eşiği={self.min_margin:.3f}, "
-            f"kararlı_kare={self.stable_frames}"
+            f"başlangıç_stage={self.stage_id}, "
+            f"enter={self.enter_radius}px, "
+            f"exit={self.exit_radius}px, "
+            f"üst_enter={self.upper_enter_radius}px, "
+            f"üst_y_oranı={self.max_stage_candidate_y_ratio:.2f}, "
+            f"odom_yedek={self.use_odom_fallback}, "
+            f"min_stage_mesafe={self.min_stage_travel_distance:.1f}m, "
+            f"min_stage_süre={self.min_stage_interval_seconds:.1f}s, "
+            f"stage_geofence={self.stage_geofence_radius:.1f}m, "
+            f"final_stage={self.final_stage}, "
+            f"final_duruş={self.stop_after_final_stage}, "
+            "kamera_QoS=RELIABLE"
+        )
+
+    def now_seconds(self):
+        return (
+            self.get_clock()
+            .now()
+            .nanoseconds
+            / 1_000_000_000.0
         )
 
     @staticmethod
-    def composite_alpha_on_white(image):
-        if image.ndim != 3:
-            return image
-
-        if image.shape[2] != 4:
-            return image
-
-        bgr = image[:, :, :3].astype(np.float32)
-
-        alpha = (
-            image[:, :, 3:4].astype(np.float32)
-            / 255.0
+    def make_red_mask(hsv):
+        # Gazebo materyallerindeki kırmızı tonlar için iki HSV aralığı.
+        lower_red_1 = np.array(
+            [0, 55, 45],
+            dtype=np.uint8,
+        )
+        upper_red_1 = np.array(
+            [18, 255, 255],
+            dtype=np.uint8,
         )
 
-        white = np.full_like(
-            bgr,
-            255.0
+        lower_red_2 = np.array(
+            [160, 55, 45],
+            dtype=np.uint8,
+        )
+        upper_red_2 = np.array(
+            [179, 255, 255],
+            dtype=np.uint8,
         )
 
-        result = (
-            bgr * alpha
-            + white * (1.0 - alpha)
+        mask_1 = cv2.inRange(
+            hsv,
+            lower_red_1,
+            upper_red_1,
+        )
+        mask_2 = cv2.inRange(
+            hsv,
+            lower_red_2,
+            upper_red_2,
         )
 
-        return result.astype(np.uint8)
-
-    @staticmethod
-    def trim_nonwhite(image):
-        gray = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2GRAY
+        red_mask = cv2.bitwise_or(
+            mask_1,
+            mask_2,
         )
-
-        mask = gray < 248
-
-        ys, xs = np.where(mask)
-
-        if len(xs) == 0 or len(ys) == 0:
-            return image
-
-        margin = 3
-
-        x1 = max(
-            0,
-            int(xs.min()) - margin
-        )
-
-        x2 = min(
-            image.shape[1],
-            int(xs.max()) + margin + 1
-        )
-
-        y1 = max(
-            0,
-            int(ys.min()) - margin
-        )
-
-        y2 = min(
-            image.shape[0],
-            int(ys.max()) + margin + 1
-        )
-
-        return image[y1:y2, x1:x2]
-
-    @staticmethod
-    def square_pad(image, value=0):
-        height, width = image.shape[:2]
-
-        size = max(
-            height,
-            width
-        )
-
-        if image.ndim == 2:
-            canvas = np.full(
-                (size, size),
-                value,
-                dtype=image.dtype,
-            )
-
-        else:
-            canvas = np.full(
-                (
-                    size,
-                    size,
-                    image.shape[2]
-                ),
-                value,
-                dtype=image.dtype,
-            )
-
-        y0 = (size - height) // 2
-        x0 = (size - width) // 2
-
-        canvas[
-            y0:y0 + height,
-            x0:x0 + width
-        ] = image
-
-        return canvas
-
-    @staticmethod
-    def rotate_image(image, angle):
-        height, width = image.shape[:2]
-
-        matrix = cv2.getRotationMatrix2D(
-            (
-                width / 2.0,
-                height / 2.0
-            ),
-            angle,
-            1.0,
-        )
-
-        return cv2.warpAffine(
-            image,
-            matrix,
-            (
-                width,
-                height
-            ),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(
-                255,
-                255,
-                255
-            ),
-        )
-
-    @staticmethod
-    def extract_glyph(image):
-        """
-        Ortak kırmızı çerçeveyi dışarıda bırakır ve yalnızca
-        merkezdeki rakam/STOP yazısını normalize eder.
-        """
-
-        image = SignDetector.square_pad(
-            image,
-            value=255
-        )
-
-        image = cv2.resize(
-            image,
-            (
-                160,
-                160
-            ),
-            interpolation=cv2.INTER_CUBIC,
-        )
-
-        gray = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        gray = cv2.GaussianBlur(
-            gray,
-            (
-                3,
-                3
-            ),
-            0
-        )
-
-        inner_mask = np.zeros(
-            (
-                160,
-                160
-            ),
-            dtype=np.uint8
-        )
-
-        cv2.circle(
-            inner_mask,
-            (
-                80,
-                80
-            ),
-            52,
-            255,
-            -1
-        )
-
-        dark = np.zeros(
-            (
-                160,
-                160
-            ),
-            dtype=np.uint8
-        )
-
-        dark[
-            (gray < 155)
-            & (inner_mask == 255)
-        ] = 255
 
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
-            (
-                3,
-                3
-            ),
+            (5, 5),
         )
 
-        dark = cv2.morphologyEx(
-            dark,
+        red_mask = cv2.morphologyEx(
+            red_mask,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=2,
+        )
+        red_mask = cv2.morphologyEx(
+            red_mask,
             cv2.MORPH_OPEN,
             kernel,
             iterations=1,
         )
 
-        count, labels, stats, _ = (
+        return red_mask
+
+    def find_best_candidate(
+        self,
+        frame,
+        hsv,
+        red_mask,
+    ):
+        height, width = frame.shape[:2]
+        frame_area = height * width
+        max_area = (
+            frame_area
+            * self.max_component_area_ratio
+        )
+
+        count, labels, stats, centroids = (
             cv2.connectedComponentsWithStats(
-                dark,
+                red_mask,
                 connectivity=8,
             )
         )
 
-        cleaned = np.zeros_like(dark)
+        candidates = []
 
-        for index in range(
-            1,
-            count
-        ):
+        # 0 arka plan bileşenidir.
+        for component_id in range(1, count):
+            x = int(
+                stats[
+                    component_id,
+                    cv2.CC_STAT_LEFT,
+                ]
+            )
+            y = int(
+                stats[
+                    component_id,
+                    cv2.CC_STAT_TOP,
+                ]
+            )
+            box_width = int(
+                stats[
+                    component_id,
+                    cv2.CC_STAT_WIDTH,
+                ]
+            )
+            box_height = int(
+                stats[
+                    component_id,
+                    cv2.CC_STAT_HEIGHT,
+                ]
+            )
             area = int(
                 stats[
-                    index,
-                    cv2.CC_STAT_AREA
+                    component_id,
+                    cv2.CC_STAT_AREA,
                 ]
             )
 
-            if area >= 8:
-                cleaned[
-                    labels == index
-                ] = 255
-
-        ys, xs = np.where(
-            cleaned > 0
-        )
-
-        if len(xs) == 0 or len(ys) == 0:
-            return np.zeros(
-                (
-                    96,
-                    96
-                ),
-                dtype=np.uint8
-            )
-
-        margin = 4
-
-        x1 = max(
-            0,
-            int(xs.min()) - margin
-        )
-
-        x2 = min(
-            cleaned.shape[1],
-            int(xs.max()) + margin + 1
-        )
-
-        y1 = max(
-            0,
-            int(ys.min()) - margin
-        )
-
-        y2 = min(
-            cleaned.shape[0],
-            int(ys.max()) + margin + 1
-        )
-
-        glyph = cleaned[
-            y1:y2,
-            x1:x2
-        ]
-
-        glyph = SignDetector.square_pad(
-            glyph,
-            value=0
-        )
-
-        glyph = cv2.resize(
-            glyph,
-            (
-                96,
-                96
-            ),
-            interpolation=cv2.INTER_NEAREST,
-        )
-
-        return glyph
-
-    def load_templates(self):
-        share_dir = get_package_share_directory(
-            "rover_sim"
-        )
-
-        texture_dir = os.path.join(
-            share_dir,
-            "models",
-            "signs",
-            "materials",
-            "textures",
-        )
-
-        specs = [
-            (
-                f"stage_{stage_id}",
-                stage_id,
-                f"sign_{stage_id}.png"
-            )
-            for stage_id in range(
-                1,
-                12
-            )
-        ]
-
-        specs.append(
-            (
-                "stop",
-                0,
-                "sign_stop.png"
-            )
-        )
-
-        templates = []
-
-        for label, stage_id, filename in specs:
-            path = os.path.join(
-                texture_dir,
-                filename
-            )
-
-            image = cv2.imread(
-                path,
-                cv2.IMREAD_UNCHANGED
-            )
-
-            if image is None:
-                self.get_logger().warning(
-                    f"Şablon okunamadı: {path}"
-                )
+            if area < self.min_component_area:
                 continue
 
-            image = self.composite_alpha_on_white(
-                image
-            )
-
-            if image.ndim == 2:
-                image = cv2.cvtColor(
-                    image,
-                    cv2.COLOR_GRAY2BGR
-                )
-
-            image = self.trim_nonwhite(
-                image
-            )
-
-            glyph = self.extract_glyph(
-                image
-            )
-
-            templates.append(
-                {
-                    "label": label,
-                    "stage_id": stage_id,
-                    "glyph": glyph,
-                }
-            )
-
-        return templates
-
-    @staticmethod
-    def red_mask(hsv):
-        low_red = cv2.inRange(
-            hsv,
-            (
-                0,
-                65,
-                45
-            ),
-            (
-                15,
-                255,
-                255
-            )
-        )
-
-        high_red = cv2.inRange(
-            hsv,
-            (
-                165,
-                65,
-                45
-            ),
-            (
-                180,
-                255,
-                255
-            )
-        )
-
-        return cv2.bitwise_or(
-            low_red,
-            high_red
-        )
-
-    def validate_circle(
-        self,
-        frame,
-        cx,
-        cy,
-        radius
-    ):
-        height, width = frame.shape[:2]
-
-        if radius < self.min_candidate_size / 2.0:
-            return None
-
-        if radius > self.max_candidate_size / 2.0:
-            return None
-
-        if cy > int(height * 0.82):
-            return None
-
-        hsv = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2HSV
-        )
-
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        red = self.red_mask(hsv)
-
-        yy, xx = np.ogrid[
-            :height,
-            :width
-        ]
-
-        distance = np.sqrt(
-            (xx - cx) ** 2
-            + (yy - cy) ** 2
-        )
-
-        inner = (
-            distance
-            <= radius * 0.72
-        )
-
-        ring = (
-            (distance >= radius * 0.72)
-            & (distance <= radius * 1.18)
-        )
-
-        inner_count = int(
-            np.count_nonzero(inner)
-        )
-
-        ring_count = int(
-            np.count_nonzero(ring)
-        )
-
-        if inner_count == 0:
-            return None
-
-        if ring_count == 0:
-            return None
-
-        white_pixels = (
-            (hsv[:, :, 1] < 90)
-            & (hsv[:, :, 2] > 120)
-            & inner
-        )
-
-        dark_pixels = (
-            (gray < 130)
-            & inner
-        )
-
-        red_pixels = (
-            (red > 0)
-            & ring
-        )
-
-        white_ratio = (
-            np.count_nonzero(
-                white_pixels
-            )
-            / inner_count
-        )
-
-        dark_ratio = (
-            np.count_nonzero(
-                dark_pixels
-            )
-            / inner_count
-        )
-
-        red_ratio = (
-            np.count_nonzero(
-                red_pixels
-            )
-            / ring_count
-        )
-
-        if white_ratio < 0.26:
-            return None
-
-        if dark_ratio < 0.008:
-            return None
-
-        if red_ratio < 0.012:
-            return None
-
-        quality = (
-            0.50 * white_ratio
-            + 0.30 * min(
-                1.0,
-                red_ratio * 8.0
-            )
-            + 0.20 * min(
-                1.0,
-                dark_ratio * 7.0
-            )
-        )
-
-        return {
-            "cx": int(cx),
-            "cy": int(cy),
-            "radius": int(radius),
-            "quality": float(quality),
-        }
-
-    def candidates_from_white_contours(
-        self,
-        frame
-    ):
-        hsv = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2HSV
-        )
-
-        white_mask = cv2.inRange(
-            hsv,
-            (
-                0,
-                0,
-                125
-            ),
-            (
-                180,
-                95,
-                255
-            ),
-        )
-
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (
-                3,
-                3
-            ),
-        )
-
-        white_mask = cv2.morphologyEx(
-            white_mask,
-            cv2.MORPH_OPEN,
-            kernel,
-            iterations=1,
-        )
-
-        white_mask = cv2.morphologyEx(
-            white_mask,
-            cv2.MORPH_CLOSE,
-            kernel,
-            iterations=1,
-        )
-
-        contours, _ = cv2.findContours(
-            white_mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        frame_area = (
-            frame.shape[0]
-            * frame.shape[1]
-        )
-
-        candidates = []
-
-        for contour in contours:
-            area = cv2.contourArea(
-                contour
-            )
-
-            if area < 45:
+            if area > max_area:
                 continue
 
-            if area > frame_area * 0.035:
+            if box_width < self.min_candidate_size:
                 continue
 
-            perimeter = cv2.arcLength(
-                contour,
-                True
+            if box_height < self.min_candidate_size:
+                continue
+
+            if box_width > self.max_candidate_size:
+                continue
+
+            if box_height > self.max_candidate_size:
+                continue
+
+            aspect = (
+                box_width
+                / float(box_height)
             )
-
-            if perimeter <= 0:
-                continue
-
-            circularity = (
-                4.0
-                * np.pi
-                * area
-                / (
-                    perimeter
-                    * perimeter
-                )
-            )
-
-            _, _, width, height = cv2.boundingRect(
-                contour
-            )
-
-            if width < self.min_candidate_size:
-                continue
-
-            if height < self.min_candidate_size:
-                continue
-
-            if width > self.max_candidate_size:
-                continue
-
-            if height > self.max_candidate_size:
-                continue
-
-            aspect = width / float(height)
 
             if not (
-                0.72
+                self.min_aspect
                 <= aspect
-                <= 1.38
+                <= self.max_aspect
             ):
                 continue
 
-            if circularity < 0.42:
+            cx = int(
+                round(
+                    centroids[
+                        component_id,
+                        0,
+                    ]
+                )
+            )
+            cy = int(
+                round(
+                    centroids[
+                        component_id,
+                        1,
+                    ]
+                )
+            )
+
+            # Yol ve koniler çoğunlukla görüntünün alt bölümündedir.
+            if cy > int(height * 0.88):
                 continue
 
-            (cx, cy), radius = (
-                cv2.minEnclosingCircle(
-                    contour
+            radius = int(
+                math.ceil(
+                    0.5
+                    * max(
+                        box_width,
+                        box_height,
+                    )
                 )
             )
 
-            validated = self.validate_circle(
-                frame,
-                cx,
-                cy,
-                radius * 1.10
+            expand = max(
+                2,
+                int(radius * 0.30),
             )
 
-            if validated is not None:
-                candidates.append(
-                    validated
-                )
-
-        return candidates
-
-    def candidates_from_hough(
-        self,
-        frame
-    ):
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        gray = cv2.GaussianBlur(
-            gray,
-            (
-                7,
-                7
-            ),
-            1.5
-        )
-
-        circles = cv2.HoughCircles(
-            gray,
-            cv2.HOUGH_GRADIENT,
-            dp=1.2,
-            minDist=30,
-            param1=120,
-            param2=23,
-            minRadius=max(
-                5,
-                self.min_candidate_size // 2
-            ),
-            maxRadius=max(
-                8,
-                self.max_candidate_size // 2
-            ),
-        )
-
-        candidates = []
-
-        if circles is None:
-            return candidates
-
-        rounded_circles = np.round(
-            circles[0]
-        ).astype(int)
-
-        for cx, cy, radius in rounded_circles:
-            validated = self.validate_circle(
-                frame,
-                int(cx),
-                int(cy),
-                int(radius),
+            x1 = max(0, x - expand)
+            y1 = max(0, y - expand)
+            x2 = min(
+                width,
+                x + box_width + expand,
+            )
+            y2 = min(
+                height,
+                y + box_height + expand,
             )
 
-            if validated is not None:
-                candidates.append(
-                    validated
-                )
+            if x2 <= x1 or y2 <= y1:
+                continue
 
-        return candidates
+            hsv_roi = hsv[y1:y2, x1:x2]
+            red_roi = red_mask[y1:y2, x1:x2]
 
-    @staticmethod
-    def candidate_iou(
-        candidate_a,
-        candidate_b
-    ):
-        ax1 = (
-            candidate_a["cx"]
-            - candidate_a["radius"]
-        )
-
-        ay1 = (
-            candidate_a["cy"]
-            - candidate_a["radius"]
-        )
-
-        ax2 = (
-            candidate_a["cx"]
-            + candidate_a["radius"]
-        )
-
-        ay2 = (
-            candidate_a["cy"]
-            + candidate_a["radius"]
-        )
-
-        bx1 = (
-            candidate_b["cx"]
-            - candidate_b["radius"]
-        )
-
-        by1 = (
-            candidate_b["cy"]
-            - candidate_b["radius"]
-        )
-
-        bx2 = (
-            candidate_b["cx"]
-            + candidate_b["radius"]
-        )
-
-        by2 = (
-            candidate_b["cy"]
-            + candidate_b["radius"]
-        )
-
-        x1 = max(
-            ax1,
-            bx1
-        )
-
-        y1 = max(
-            ay1,
-            by1
-        )
-
-        x2 = min(
-            ax2,
-            bx2
-        )
-
-        y2 = min(
-            ay2,
-            by2
-        )
-
-        intersection = (
-            max(
-                0,
-                x2 - x1
-            )
-            * max(
-                0,
-                y2 - y1
-            )
-        )
-
-        area_a = (
-            max(
-                0,
-                ax2 - ax1
-            )
-            * max(
-                0,
-                ay2 - ay1
-            )
-        )
-
-        area_b = (
-            max(
-                0,
-                bx2 - bx1
-            )
-            * max(
-                0,
-                by2 - by1
-            )
-        )
-
-        union = (
-            area_a
-            + area_b
-            - intersection
-        )
-
-        if union <= 0:
-            return 0.0
-
-        return intersection / union
-
-    def find_candidates(self, frame):
-        candidates = (
-            self.candidates_from_white_contours(
-                frame
-            )
-        )
-
-        candidates.extend(
-            self.candidates_from_hough(
-                frame
-            )
-        )
-
-        candidates = sorted(
-            candidates,
-            key=lambda item: (
-                item["radius"],
-                item["quality"],
-            ),
-            reverse=True,
-        )
-
-        kept = []
-
-        for candidate in candidates:
-            is_separate = all(
-                self.candidate_iou(
-                    candidate,
-                    old
-                ) < 0.45
-                for old in kept
+            white_mask = (
+                (hsv_roi[:, :, 1] < 125)
+                & (hsv_roi[:, :, 2] > 90)
             )
 
-            if is_separate:
-                kept.append(
-                    candidate
-                )
-
-        return kept[
-            :self.max_candidates
-        ]
-
-    @staticmethod
-    def crop_candidate(
-        frame,
-        candidate
-    ):
-        cx = candidate["cx"]
-        cy = candidate["cy"]
-
-        radius = int(
-            candidate["radius"]
-            * 1.18
-        )
-
-        height, width = frame.shape[:2]
-
-        x1 = max(
-            0,
-            cx - radius
-        )
-
-        y1 = max(
-            0,
-            cy - radius
-        )
-
-        x2 = min(
-            width,
-            cx + radius
-        )
-
-        y2 = min(
-            height,
-            cy + radius
-        )
-
-        crop = frame[
-            y1:y2,
-            x1:x2
-        ].copy()
-
-        if crop.size == 0:
-            return None, None
-
-        return crop, (
-            x1,
-            y1,
-            x2,
-            y2
-        )
-
-    @staticmethod
-    def binary_dice(
-        mask_a,
-        mask_b
-    ):
-        a = mask_a > 0
-        b = mask_b > 0
-
-        denominator = (
-            np.count_nonzero(a)
-            + np.count_nonzero(b)
-        )
-
-        if denominator == 0:
-            return 0.0
-
-        intersection = np.count_nonzero(
-            a & b
-        )
-
-        return (
-            2.0
-            * intersection
-            / denominator
-        )
-
-    @staticmethod
-    def binary_iou(
-        mask_a,
-        mask_b
-    ):
-        a = mask_a > 0
-        b = mask_b > 0
-
-        union = np.count_nonzero(
-            a | b
-        )
-
-        if union == 0:
-            return 0.0
-
-        intersection = np.count_nonzero(
-            a & b
-        )
-
-        return intersection / union
-
-    @staticmethod
-    def correlation(
-        mask_a,
-        mask_b
-    ):
-        value = cv2.matchTemplate(
-            mask_a,
-            mask_b,
-            cv2.TM_CCOEFF_NORMED,
-        )[0, 0]
-
-        if np.isnan(value):
-            return 0.0
-
-        return max(
-            0.0,
-            float(value)
-        )
-
-    def classify_candidate(
-        self,
-        crop
-    ):
-        best_by_label = {}
-
-        for angle in (
-            -12,
-            -8,
-            -4,
-            0,
-            4,
-            8,
-            12
-        ):
-            rotated = self.rotate_image(
-                crop,
-                angle
+            white_ratio = float(
+                np.count_nonzero(white_mask)
+                / white_mask.size
             )
 
-            glyph = self.extract_glyph(
-                rotated
+            red_fill_ratio = float(
+                np.count_nonzero(red_roi)
+                / red_roi.size
             )
 
-            for template in self.templates:
-                template_glyph = template[
-                    "glyph"
-                ]
+            if white_ratio < self.min_white_ratio:
+                continue
 
-                dice = self.binary_dice(
-                    glyph,
-                    template_glyph
-                )
+            if (
+                red_fill_ratio
+                < self.min_red_fill_ratio
+            ):
+                continue
 
-                iou = self.binary_iou(
-                    glyph,
-                    template_glyph
-                )
+            # Yakın/büyük levha öncelikli, renk oranları destekleyicidir.
+            score = (
+                radius
+                + 20.0 * white_ratio
+                + 10.0 * red_fill_ratio
+            )
 
-                corr = self.correlation(
-                    glyph,
-                    template_glyph
-                )
+            candidates.append(
+                {
+                    "cx": cx,
+                    "cy": cy,
+                    "radius": radius,
+                    "box": (
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                    ),
+                    "white_ratio": white_ratio,
+                    "red_ratio": red_fill_ratio,
+                    "score": score,
+                    "frame_height": height,
+                }
+            )
 
-                score = (
-                    0.45 * dice
-                    + 0.35 * iou
-                    + 0.20 * corr
-                )
-
-                label = template[
-                    "label"
-                ]
-
-                previous = best_by_label.get(
-                    label
-                )
-
-                if (
-                    previous is None
-                    or score > previous["score"]
-                ):
-                    best_by_label[label] = {
-                        "label": label,
-                        "stage_id": template[
-                            "stage_id"
-                        ],
-                        "score": float(score),
-                    }
-
-        if not best_by_label:
-            return None
-
-        ranked = sorted(
-            best_by_label.values(),
+        candidates.sort(
             key=lambda item: item["score"],
             reverse=True,
         )
 
-        best = dict(
-            ranked[0]
-        )
-
-        if len(ranked) > 1:
-            second = ranked[1]
-
-        else:
-            second = {
-                "label": "none",
-                "score": 0.0,
-            }
-
-        best["second_label"] = second[
-            "label"
-        ]
-
-        best["second_score"] = float(
-            second["score"]
-        )
-
-        best["margin"] = float(
-            best["score"]
-            - second["score"]
-        )
-
-        best["accepted"] = (
-            best["score"]
-            >= self.min_confidence
-            and best["margin"]
-            >= self.min_margin
-        )
-
-        return best
-
-    def choose_best_detection(
-        self,
-        frame
-    ):
-        candidates = self.find_candidates(
-            frame
-        )
-
-        detections = []
-
-        for candidate in candidates:
-            crop, box = self.crop_candidate(
-                frame,
-                candidate
-            )
-
-            if crop is None:
-                continue
-
-            classification = self.classify_candidate(
-                crop
-            )
-
-            if classification is None:
-                continue
-
-            size_bonus = min(
-                0.05,
-                candidate["radius"] / 1000.0,
-            )
-
-            selection_score = (
-                classification["score"]
-                + 0.75
-                * classification["margin"]
-                + size_bonus
-            )
-
-            detections.append(
-                {
-                    "candidate": candidate,
-                    "box": box,
-                    "classification": classification,
-                    "selection_score": float(
-                        selection_score
-                    ),
-                }
-            )
-
-        if not detections:
-            return None, candidates
-
-        detections.sort(
-            key=lambda item: item[
-                "selection_score"
-            ],
-            reverse=True,
-        )
-
-        return (
-            detections[0],
+        self.last_candidate_count = len(
             candidates
         )
 
-    def update_stability(
+        if not candidates:
+            return None
+
+        upper_candidates = [
+            item
+            for item in candidates
+            if item["cy"]
+            <= int(
+                height
+                * self.max_stage_candidate_y_ratio
+            )
+        ]
+
+        # Stage levhası için üst bölgedeki adayı tercih et.
+        # Alt bölgedeki kırmızı koniler debug görüntüsünde kalır,
+        # fakat stage sayacını ilerletmez.
+        if upper_candidates:
+            return upper_candidates[0]
+
+        return candidates[0]
+
+    def stage_travel_distance(self):
+        if (
+            self.odom_x is None
+            or self.odom_y is None
+            or self.last_stage_change_x is None
+            or self.last_stage_change_y is None
+        ):
+            return None
+
+        dx = self.odom_x - self.last_stage_change_x
+        dy = self.odom_y - self.last_stage_change_y
+
+        return math.hypot(dx, dy)
+
+    def distance_to_expected_stage(
         self,
-        raw_label,
-        raw_confidence
+        stage_id,
     ):
-        if raw_label is None:
-            self.pending_label = None
-            self.pending_count = 0
-
-            self.lost_frames += 1
-
-            if (
-                self.lost_frames
-                >= self.lost_frames_limit
-            ):
-                self.stable_label = None
-                self.stable_confidence = 0.0
-
-            return self.stable_label
-
-        self.lost_frames = 0
-
-        if raw_label == self.pending_label:
-            self.pending_count += 1
-
-        else:
-            self.pending_label = raw_label
-            self.pending_count = 1
+        target = self.STAGE_POSITIONS.get(
+            int(stage_id)
+        )
 
         if (
-            self.pending_count
-            >= self.stable_frames
+            target is None
+            or self.odom_x is None
+            or self.odom_y is None
         ):
-            if raw_label != self.stable_label:
-                self.get_logger().info(
-                    "Kararlı tabela algılandı: "
-                    f"{raw_label}"
+            return None
+
+        target_x, target_y = target
+
+        return math.hypot(
+            self.odom_x - target_x,
+            self.odom_y - target_y,
+        )
+
+    def stage_interval_seconds(self):
+        if self.last_stage_change_time is None:
+            return None
+
+        return (
+            self.now_seconds()
+            - self.last_stage_change_time
+        )
+
+    def stage_change_allowed(self):
+        next_stage_id = min(
+            self.stage_id + 1,
+            11,
+        )
+
+        distance = self.stage_travel_distance()
+        interval = self.stage_interval_seconds()
+        target_distance = (
+            self.distance_to_expected_stage(
+                next_stage_id
+            )
+        )
+
+        distance_ok = (
+            self.stage_id == 0
+            or distance is None
+            or distance
+            >= self.min_stage_travel_distance
+        )
+
+        interval_ok = (
+            self.stage_id == 0
+            or interval is None
+            or interval
+            >= self.min_stage_interval_seconds
+        )
+
+        geofence_ok = (
+            not self.use_stage_geofence
+            or target_distance is None
+            or target_distance
+            <= self.stage_geofence_radius
+        )
+
+        target_text = (
+            "bilinmiyor"
+            if target_distance is None
+            else f"{target_distance:.2f}m"
+        )
+
+        if (
+            distance_ok
+            and interval_ok
+            and geofence_ok
+        ):
+            return True, (
+                f"son_stage_mesafe="
+                f"{distance if distance is not None else -1.0:.2f}m, "
+                f"süre="
+                f"{interval if interval is not None else -1.0:.2f}s, "
+                f"stage_{next_stage_id}_uzaklık="
+                f"{target_text}"
+            )
+
+        return False, (
+            f"son_stage_mesafe="
+            f"{distance if distance is not None else -1.0:.2f}m/"
+            f"{self.min_stage_travel_distance:.2f}m, "
+            f"süre="
+            f"{interval if interval is not None else -1.0:.2f}s/"
+            f"{self.min_stage_interval_seconds:.2f}s, "
+            f"stage_{next_stage_id}_uzaklık="
+            f"{target_text}/"
+            f"{self.stage_geofence_radius:.2f}m"
+        )
+
+    def record_stage_change(self):
+        self.last_stage_change_time = (
+            self.now_seconds()
+        )
+
+        if (
+            self.odom_x is not None
+            and self.odom_y is not None
+        ):
+            self.last_stage_change_x = self.odom_x
+            self.last_stage_change_y = self.odom_y
+
+    def update_stage(self, candidate):
+        if self.final_stop_active:
+            self.last_radius = 0
+            self.last_center = None
+            return
+
+        if candidate is None:
+            radius = 0
+        else:
+            radius = int(
+                candidate["radius"]
+            )
+
+        self.last_radius = radius
+        self.last_center = (
+            None
+            if candidate is None
+            else (
+                int(candidate["cx"]),
+                int(candidate["cy"]),
+            )
+        )
+
+        if candidate is None:
+            candidate_is_upper = False
+        else:
+            candidate_is_upper = (
+                candidate["cy"]
+                <= int(
+                    candidate["frame_height"]
+                    * self.max_stage_candidate_y_ratio
+                )
+            )
+
+        effective_enter_radius = (
+            self.upper_enter_radius
+            if candidate_is_upper
+            else self.enter_radius
+        )
+
+        close_sign = (
+            candidate is not None
+            and candidate_is_upper
+            and radius >= effective_enter_radius
+        )
+
+        sign_gone = (
+            candidate is None
+            or not candidate_is_upper
+            or radius <= self.exit_radius
+        )
+
+        # Stage 8'den sonra bir sonraki yakın levha STOP olarak kullanılır.
+        stop_guard_passed = (
+            self.stage_id == 8
+            and self.stage8_started_at is not None
+            and (
+                self.now_seconds()
+                - self.stage8_started_at
+            )
+            >= self.stop_guard_seconds
+        )
+
+        if (
+            self.stage_id == 8
+            and not self.stop_completed
+            and not self.encounter_active
+            and stop_guard_passed
+        ):
+            if close_sign:
+                self.enter_count += 1
+            else:
+                self.enter_count = 0
+
+            if self.enter_count >= self.enter_frames:
+                self.enter_count = 0
+                self.stop_active = True
+                self.encounter_active = True
+
+                self.get_logger().warning(
+                    f"STOP levhası algılandı "
+                    f"(r={radius}px)."
                 )
 
-            self.stable_label = raw_label
-            self.stable_confidence = (
-                raw_confidence
+            return
+
+        if self.stop_active:
+            if sign_gone:
+                self.exit_count += 1
+            else:
+                self.exit_count = 0
+
+            if self.exit_count >= self.exit_frames:
+                self.exit_count = 0
+                self.stop_active = False
+                self.stop_completed = True
+                self.encounter_active = False
+
+                self.get_logger().info(
+                    "STOP levhası geride kaldı."
+                )
+
+            return
+
+        if not self.encounter_active:
+            if close_sign:
+                self.enter_count += 1
+            else:
+                self.enter_count = 0
+
+            if self.enter_count < self.enter_frames:
+                return
+
+            allowed, gate_reason = (
+                self.stage_change_allowed()
             )
 
-        return self.stable_label
+            if not allowed:
+                # Aynı yanlış nesne her iki karede bir tekrar denemesin.
+                self.enter_count = 0
 
-    def start_image_viewer(self):
-        """
-        OpenCV penceresi kullanıldığı için bu metot artık pasiftir.
-        """
-        pass
+                self.get_logger().warning(
+                    "Yeni tabela adayı reddedildi: "
+                    f"stage_{self.stage_id} korunuyor, "
+                    f"r={radius}px, {gate_reason}."
+                )
+                return
 
-    def stop_image_viewer(self):
-        """
-        Sign detector kapanırken OpenCV pencerelerini kapatır.
-        """
-        cv2.destroyAllWindows()
+            self.enter_count = 0
+            self.encounter_active = True
 
+            if self.stage_id < self.final_stage:
+                old_stage = self.stage_id
+                self.stage_id += 1
+                self.record_stage_change()
 
-    def template_by_label(
+                if self.stage_id == 8:
+                    self.stage8_started_at = (
+                        self.now_seconds()
+                    )
+                    self.stop_completed = False
+
+                self.get_logger().info(
+                    f"Yeni fiziksel levha: "
+                    f"stage_{old_stage} -> "
+                    f"stage_{self.stage_id} "
+                    f"(r={radius}px, {gate_reason})."
+                )
+
+            return
+
+        # Mevcut levhanın görüntüden çıkmasını bekle.
+        if sign_gone:
+            self.exit_count += 1
+        else:
+            self.exit_count = 0
+
+        if self.exit_count >= self.exit_frames:
+            self.exit_count = 0
+
+            if (
+                self.stop_after_final_stage
+                and self.stage_id == self.final_stage
+            ):
+                self.encounter_active = True
+                self.final_stop_active = True
+
+                self.get_logger().warning(
+                    f"FINAL: stage_{self.final_stage} levhası "
+                    "geride kaldı. Parkur tamamlandı; "
+                    "kalıcı duruş komutu gönderiliyor."
+                )
+
+                self.publish_state()
+                return
+
+            self.encounter_active = False
+
+            self.get_logger().info(
+                f"stage_{self.stage_id} levhası "
+                "geride kaldı; sonraki levha için hazır."
+            )
+
+    def force_stage(
         self,
-        label
+        new_stage,
+        reason,
     ):
-        for template in self.templates:
-            if template["label"] == label:
-                return template
+        new_stage = int(new_stage)
 
-        return None
+        if new_stage <= self.stage_id:
+            return
 
-    def publish_result(self):
-        stage_msg = Int32()
-        stop_msg = Bool()
-        label_msg = String()
-        confidence_msg = Float32()
+        old_stage = self.stage_id
+        self.stage_id = min(
+            self.final_stage,
+            new_stage,
+        )
+        self.record_stage_change()
 
-        if self.stable_label:
-            template = self.template_by_label(
-                self.stable_label
+        self.enter_count = 0
+        self.exit_count = 0
+
+        # Geofence geçişinden sonra görünür durumdaki levhanın aynı anda
+        # bir stage daha artırmasını engelle.
+        self.encounter_active = True
+
+        if self.stage_id == 8:
+            self.stage8_started_at = (
+                self.now_seconds()
             )
+            self.stop_completed = False
 
-        else:
-            template = None
-
-        if template is None:
-            stage_msg.data = 0
-            stop_msg.data = False
-            label_msg.data = "none"
-            confidence_msg.data = 0.0
-
-        else:
-            stage_msg.data = int(
-                template["stage_id"]
-            )
-
-            stop_msg.data = (
-                template["label"]
-                == "stop"
-            )
-
-            label_msg.data = str(
-                template["label"]
-            )
-
-            confidence_msg.data = float(
-                self.stable_confidence
-            )
-
-        self.stage_pub.publish(
-            stage_msg
+        self.get_logger().warning(
+            f"Odometri yedeği: "
+            f"stage_{old_stage} -> "
+            f"stage_{self.stage_id}. "
+            f"Neden: {reason}"
         )
 
-        self.stop_pub.publish(
-            stop_msg
+        self.publish_state()
+
+    def odom_callback(self, msg):
+        self.odom_x = float(
+            msg.pose.pose.position.x
+        )
+        self.odom_y = float(
+            msg.pose.pose.position.y
         )
 
-        self.label_pub.publish(
-            label_msg
-        )
+        if not self.use_odom_fallback:
+            return
 
-        self.conf_pub.publish(
-            confidence_msg
-        )
-
-    def image_callback(self, msg):
-        try:
-            frame = self.bridge.imgmsg_to_cv2(
-                msg,
-                desired_encoding="bgr8",
+        # Stage 5 parkuru yaklaşık y=10 doğrultusunda +x yönündedir.
+        # Stage 6 levhası kaçsa bile kayan engelden önce Stage 6 açılır.
+        if (
+            self.stage_id == 5
+            and self.odom_x
+            >= self.stage5_to6_x
+            and abs(
+                self.odom_y
+                - self.stage5_lane_y
             )
-
-        except Exception as exc:
-            self.get_logger().error(
-                "Kamera görüntüsü çevrilemedi: "
-                f"{exc}"
+            <= self.stage5_lane_tolerance
+        ):
+            self.force_stage(
+                6,
+                (
+                    f"x={self.odom_x:.2f}, "
+                    f"y={self.odom_y:.2f}"
+                ),
             )
             return
 
+        # Stage 6'dan sonra parkur kuzeye dönüp Stage 7 alanına çıkar.
+        # Stage 7 levhası gelmeden önce sıra Stage 6'da kalır; Stage 7
+        # bölgesine ulaşınca kesin olarak Stage 7'ye geçilir.
+        if (
+            self.stage_id == 6
+            and self.odom_x
+            >= self.stage6_to7_min_x
+            and self.odom_y
+            >= self.stage6_to7_y
+        ):
+            self.force_stage(
+                7,
+                (
+                    f"x={self.odom_x:.2f}, "
+                    f"y={self.odom_y:.2f}"
+                ),
+            )
+
+    def publish_state(self):
+        stage_msg = Int32()
+        stage_msg.data = int(
+            self.stage_id
+        )
+        self.stage_pub.publish(stage_msg)
+
+        order_msg = Int32()
+        order_msg.data = int(
+            self.stage_id
+        )
+        self.stage_order_pub.publish(
+            order_msg
+        )
+
+        stop_msg = Bool()
+        stop_msg.data = bool(
+            self.stop_active
+        )
+        self.stop_pub.publish(stop_msg)
+
+        final_stop_msg = Bool()
+        final_stop_msg.data = bool(
+            self.final_stop_active
+        )
+        self.final_stop_pub.publish(
+            final_stop_msg
+        )
+
+        label_msg = String()
+
+        if self.final_stop_active:
+            label_msg.data = "final_stop"
+        elif self.stop_active:
+            label_msg.data = "stop"
+        elif self.stage_id > 0:
+            label_msg.data = (
+                f"stage_{self.stage_id}"
+            )
+        else:
+            label_msg.data = "none"
+
+        self.label_pub.publish(label_msg)
+
+        confidence_msg = Float32()
+
+        if self.last_radius <= 0:
+            confidence_msg.data = 0.0
+        else:
+            confidence_msg.data = float(
+                min(
+                    1.0,
+                    self.last_radius
+                    / max(
+                        1.0,
+                        float(
+                            self.enter_radius
+                        ),
+                    ),
+                )
+            )
+
+        self.confidence_pub.publish(
+            confidence_msg
+        )
+
+    def draw_debug(
+        self,
+        frame,
+        candidate,
+    ):
         debug = frame.copy()
 
-        best_detection, all_candidates = (
-            self.choose_best_detection(
-                frame
-            )
-        )
-
-        raw_label = None
-        raw_confidence = 0.0
-
-        best_label = "none"
-        second_label = "none"
-
-        margin = 0.0
-
-        if best_detection is not None:
-            classification = best_detection[
-                "classification"
-            ]
-
-            best_label = classification[
-                "label"
-            ]
-
-            second_label = classification[
-                "second_label"
-            ]
-
-            margin = classification[
-                "margin"
-            ]
-
-            raw_confidence = classification[
-                "score"
-            ]
-
-            if classification["accepted"]:
-                raw_label = classification[
-                    "label"
-                ]
-
-        self.update_stability(
-            raw_label,
-            raw_confidence
-        )
-
-        self.publish_result()
-
-        # Bulunan bütün adayları ince gri daireyle göster.
-        for candidate in all_candidates:
-            cv2.circle(
-                debug,
-                (
-                    candidate["cx"],
-                    candidate["cy"]
-                ),
-                candidate["radius"],
-                (
-                    160,
-                    160,
-                    160
-                ),
-                1,
-            )
-
-        # En iyi aday turuncu daire ve kutuyla gösterilir.
-        if best_detection is not None:
-            candidate = best_detection[
-                "candidate"
-            ]
-
-            x1, y1, x2, y2 = best_detection[
-                "box"
-            ]
-
-            cv2.circle(
-                debug,
-                (
-                    candidate["cx"],
-                    candidate["cy"]
-                ),
-                candidate["radius"],
-                (
-                    0,
-                    200,
-                    255
-                ),
-                2,
+        if candidate is not None:
+            x1, y1, x2, y2 = (
+                candidate["box"]
             )
 
             cv2.rectangle(
                 debug,
-                (
-                    x1,
-                    y1
-                ),
-                (
-                    x2,
-                    y2
-                ),
-                (
-                    0,
-                    200,
-                    255
-                ),
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 255),
                 2,
             )
-
-            label_text = (
-                f"best={best_label} "
-                f"{raw_confidence:.2f} "
-                f"2nd={second_label} "
-                f"d={margin:.3f}"
+            cv2.circle(
+                debug,
+                (
+                    candidate["cx"],
+                    candidate["cy"],
+                ),
+                candidate["radius"],
+                (0, 255, 255),
+                2,
             )
 
             cv2.putText(
                 debug,
-                label_text,
+                (
+                    f"r={candidate['radius']} "
+                    f"white={candidate['white_ratio']:.2f} "
+                    f"red={candidate['red_ratio']:.2f}"
+                ),
                 (
                     x1,
                     max(
-                        20,
-                        y1 - 7
-                    )
+                        22,
+                        y1 - 8,
+                    ),
                 ),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (
-                    0,
-                    200,
-                    255
-                ),
+                0.48,
+                (0, 255, 255),
                 1,
                 cv2.LINE_AA,
             )
 
         status = (
-            f"best={best_label} "
-            f"stable={self.stable_label or 'none'} "
-            f"score={raw_confidence:.2f} "
-            f"margin={margin:.3f}"
+            f"stage={self.stage_id} "
+            f"stop={int(self.stop_active)} "
+            f"final={int(self.final_stop_active)} "
+            f"candidate={int(candidate is not None)} "
+            f"r={self.last_radius} "
+            f"armed={int(not self.encounter_active)} "
+            f"proc={self.last_process_seconds:.3f}s"
         )
 
         cv2.putText(
             debug,
             status,
-            (
-                12,
-                25
-            ),
+            (12, 26),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            (
-                0,
-                255,
-                0
-            ),
+            0.55,
+            (0, 255, 0),
             2,
             cv2.LINE_AA,
         )
 
-        try:
-            debug_msg = self.bridge.cv2_to_imgmsg(
-                debug,
-                encoding="bgr8",
+        return debug
+
+    def image_callback(self, msg):
+        started_at = time.perf_counter()
+
+        if not self.first_callback_seen:
+            self.first_callback_seen = True
+            self.get_logger().info(
+                "İlk kamera callback'i alındı."
             )
 
-            debug_msg.header = msg.header
+        try:
+            frame = self.bridge.imgmsg_to_cv2(
+                msg,
+                desired_encoding="bgr8",
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                "Kamera görüntüsü bgr8'e "
+                f"çevrilemedi: {exc}"
+            )
+            return
 
+        self.frame_count += 1
+
+        hsv = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2HSV,
+        )
+        red_mask = self.make_red_mask(
+            hsv
+        )
+
+        self.last_red_pixels = int(
+            np.count_nonzero(red_mask)
+        )
+
+        candidate = self.find_best_candidate(
+            frame,
+            hsv,
+            red_mask,
+        )
+
+        self.update_stage(candidate)
+        self.publish_state()
+
+        self.last_process_seconds = (
+            time.perf_counter()
+            - started_at
+        )
+
+        debug = self.draw_debug(
+            frame,
+            candidate,
+        )
+
+        try:
+            debug_msg = (
+                self.bridge.cv2_to_imgmsg(
+                    debug,
+                    encoding="bgr8",
+                )
+            )
+            debug_msg.header = msg.header
             self.debug_pub.publish(
                 debug_msg
             )
-
         except Exception as exc:
-            self.get_logger().warning(
+            self.get_logger().error(
                 "Debug görüntüsü yayınlanamadı: "
                 f"{exc}"
             )
 
+        if (
+            self.frame_count
+            % self.diagnostic_every_frames
+            == 0
+        ):
+            center_text = (
+                "none"
+                if self.last_center is None
+                else (
+                    f"{self.last_center[0]},"
+                    f"{self.last_center[1]}"
+                )
+            )
+
+            if self.stage_id >= self.final_stage:
+                next_stage_id = self.final_stage
+                next_distance_text = "FINAL"
+            else:
+                next_stage_id = min(
+                    self.stage_id + 1,
+                    self.final_stage,
+                )
+                next_stage_distance = (
+                    self.distance_to_expected_stage(
+                        next_stage_id
+                    )
+                )
+                next_distance_text = (
+                    "none"
+                    if next_stage_distance is None
+                    else f"{next_stage_distance:.2f}"
+                )
+
+            self.get_logger().info(
+                "[VISION] "
+                f"frame={self.frame_count} "
+                f"red_px={self.last_red_pixels} "
+                f"candidates={self.last_candidate_count} "
+                f"center={center_text} "
+                f"r={self.last_radius} "
+                f"stage={self.stage_id} "
+                f"next_stage={next_stage_id} "
+                f"next_dist={next_distance_text} "
+                f"odom=({self.odom_x if self.odom_x is not None else 'none'},"
+                f"{self.odom_y if self.odom_y is not None else 'none'}) "
+                f"proc={self.last_process_seconds:.3f}s"
+            )
 
 
 def main(args=None):
     rclpy.init(args=args)
-
     node = SignDetector()
 
     try:
         rclpy.spin(node)
-
     except KeyboardInterrupt:
         pass
-
     finally:
-        node.stop_image_viewer()
         node.destroy_node()
 
         if rclpy.ok():
