@@ -209,6 +209,16 @@ def launch_setup(context, *args, **kwargs):
                 "ramp_speed": 0.45,
                 "ramp_boost_speed": 0.55,
                 "ramp_boost_delay": 2.0,
+
+                # Rampa algılandıktan sonra rover rampanın üzerinde
+                # tamamen hareketsiz bekler, sonra çıkmaya devam eder.
+                "ramp_pause_duration": 2.0,
+
+                # Rampa algılandıktan sonra yaklaşık 20 cm daha ilerler,
+                # ardından rampanın üzerinde 2 saniye bekler.
+                "ramp_creep_duration": 3.0,
+                "ramp_creep_speed": 0.25,
+
                 "search_speed": 0.08,
                 "ramp_pitch_threshold_deg": 8.0,
                 "flat_pitch_threshold_deg": 3.0,
