@@ -44,6 +44,7 @@ class FallowCorridorNode(Node):
         self.declare_parameter('front_obstacle_dist', 1.8)     # Distance to start slowing down for front obstacles
         self.declare_parameter('front_stop_dist', 0.65)        # Distance to stop the robot completely
         self.declare_parameter('min_points_threshold', 15)     # Min points to consider a wall detected
+        self.declare_parameter('single_wall_target_dist', 1.2)  # Target distance from wall in single-wall mode (meters)
 
         # Node State Variables
         self.current_pitch = 0.0
@@ -108,6 +109,7 @@ class FallowCorridorNode(Node):
         front_obstacle_dist = self.get_parameter('front_obstacle_dist').value
         front_stop_dist = self.get_parameter('front_stop_dist').value
         min_points_threshold = self.get_parameter('min_points_threshold').value
+        single_wall_target_dist = self.get_parameter('single_wall_target_dist').value
 
         # Unpack PointCloud2 data
         try:
@@ -192,14 +194,14 @@ class FallowCorridorNode(Node):
             angular_z = kp_center * target_y
             control_mode = "CENTERING"
         elif has_left:
-            # Single-wall following (left): maintain 1.5m distance
-            error = 1.5 - left_y
-            angular_z = -kp_center * error
+            # Single-wall following (left): gentler gain to avoid overcorrection
+            error = single_wall_target_dist - left_y
+            angular_z = -kp_center * 0.5 * error
             control_mode = "FOLLOW_LEFT"
         elif has_right:
-            # Single-wall following (right): maintain 1.5m distance
-            error = 1.5 - abs(right_y)
-            angular_z = kp_center * error
+            # Single-wall following (right): gentler gain to avoid overcorrection
+            error = single_wall_target_dist - abs(right_y)
+            angular_z = kp_center * 0.5 * error
             control_mode = "FOLLOW_RIGHT"
         else:
             control_mode = "NO_WALLS"
