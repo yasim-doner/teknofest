@@ -37,8 +37,15 @@ install(PROGRAMS
   src/sign_detect.py
   src/cmd_switch.py
   src/cone_avoid.py
+  src/laser_target.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
+file(GLOB PYTHON_NODES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.py")
+
+install(PROGRAMS
+  ${PYTHON_NODES}
+  DESTINATION lib/${PROJECT_NAME}
+)
 ament_package()
 
