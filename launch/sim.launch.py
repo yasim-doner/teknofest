@@ -146,11 +146,26 @@ def launch_setup(context, *args, **kwargs):
         ],
     )
 
-    # Stage 8 Ramp + Laser Task Node
-    laser_target_node = Node(
+    # Stage 8 Ramp Task Node
+    ramp_node = Node(
         package="teknofest",
-        executable="laser_target.py",
-        name="laser_target",
+        executable="ramp.py",
+        name="ramp",
+        output="screen",
+        parameters=[
+            params_file_path,
+            {
+                "use_sim_time": True,
+                "initial_stage": stage,
+            },
+        ],
+    )
+
+    # Target Detector Node (Görüntü işleme ile nişan ve /laser_angle yayını)
+    target_detect_node = Node(
+        package="teknofest",
+        executable="target_detect.py",
+        name="target_detect",
         output="screen",
         parameters=[
             params_file_path,
@@ -205,7 +220,8 @@ def launch_setup(context, *args, **kwargs):
         cone_avoid_node,
         dynamic_obstacle_node,
         sign_detect_node,
-        laser_target_node,
+        ramp_node,
+        target_detect_node,
         cmd_switch_node,
         rviz_node,
     ]

@@ -37,7 +37,8 @@ install(PROGRAMS
   src/sign_detect.py
   src/cmd_switch.py
   src/cone_avoid.py
-  src/laser_target.py
+  src/ramp.py
+  src/target_detect.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -2,7 +2,7 @@
 
 import math
 import rclpy
-from geometry_msgs.msg import PointStamped, Twist, Vector3
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -10,31 +10,7 @@ from sensor_msgs.msg import Imu
 from std_msgs.msg import Bool, Int32
 
 
-def calculate_turret_angles(p_laser, p_target):
-    """
-    Calculates precise Yaw and Pitch angles in degrees.
-    p_laser:  (x, y, z) tuple/list
-    p_target: (x, y, z) tuple/list
-    """
-    dx = p_target[0] - p_laser[0]
-    dy = p_target[1] - p_laser[1]
-    dz = p_target[2] - p_laser[2]
-
-    # Horizontal distance in XY plane
-    d_xy = math.hypot(dx, dy)
-
-    # Calculate angles in radians
-    yaw_rad = math.atan2(dy, dx)
-    pitch_rad = math.atan2(dz, d_xy)
-
-    # Convert to degrees
-    yaw_deg = math.degrees(yaw_rad)
-    pitch_deg = math.degrees(pitch_rad)
-
-    return yaw_deg, pitch_deg
-
-
-class LaserTarget(Node):
+class RampNode(Node):
     """
     Stage 8 rampa + lazer görevi.
 
@@ -43,14 +19,14 @@ class LaserTarget(Node):
     2. Rampaya çıkış algılandığında (pitch >= 8°) 2s durur (RAMP_UP_STOP).
     3. Rampayı tırmanır (CLIMBING_RAMP).
     4. Düzlüğe ulaşıldığında veya STOP tabelası görüldüğünde durur (STOPPING_AT_TOP - 2s).
-    5. 1.2 saniye lazer yakar (LASER_ON) ve /laser_angle yayınlar.
+    5. 1.2 saniye lazer yakar (LASER_ON).
     6. Rampadan aşağı iner (DESCENDING_RAMP).
     7. İniş tamamlandığında 2s durur (RAMP_DOWN_STOP).
     8. /teknofest/release = 8 yayınlar (DONE).
     """
 
     def __init__(self):
-        super().__init__("laser_target")
+        super().__init__("ramp")
 
         self.declare_parameter("active_stage", 8)
         self.declare_parameter("initial_stage", 0)
@@ -78,8 +54,6 @@ class LaserTarget(Node):
         self.laser_duration = float(self.get_parameter("laser_duration").value)
         self.flat_drive_duration = float(self.get_parameter("flat_drive_duration").value)
 
-        self.target_pos = None  # Kameradan dinamik tespit edilir (/teknofest/target_point)
-
         self.current_stage = self.initial_stage
         self.pitch = 0.0
         self.odom_pos = (0.0, 0.0, 0.5)
@@ -98,17 +72,12 @@ class LaserTarget(Node):
 
         self.cmd_vel_pub = self.create_publisher(
             Twist,
-            "/laser_target/cmd_vel",
+            "/ramp/cmd_vel",
             10,
         )
         self.laser_pub = self.create_publisher(
             Bool,
             "/teknofest/laser_on",
-            10,
-        )
-        self.laser_angle_pub = self.create_publisher(
-            Vector3,
-            "/laser_angle",
             10,
         )
         self.release_pub = self.create_publisher(
@@ -135,12 +104,6 @@ class LaserTarget(Node):
             self.odom_callback,
             10,
         )
-        self.target_sub = self.create_subscription(
-            PointStamped,
-            "/teknofest/target_point",
-            self.target_point_callback,
-            10,
-        )
 
         self.timer = self.create_timer(
             0.05,
@@ -148,7 +111,7 @@ class LaserTarget(Node):
         )
 
         self.get_logger().info(
-            f"=== Stage 8 Laser Target Node başladı (Hız={self.drive_speed} m/s, Durma={self.stop_duration}s) ==="
+            f"=== Stage 8 Ramp Node başladı (Hız={self.drive_speed} m/s, Durma={self.stop_duration}s) ==="
         )
 
     def now_seconds(self):
@@ -187,28 +150,6 @@ class LaserTarget(Node):
         msg = Bool()
         msg.data = bool(is_on)
         self.laser_pub.publish(msg)
-
-    def publish_laser_angle(self):
-        if self.target_pos is None:
-            self.get_logger().warning(
-                "Kameradan henüz hedef noktası (/teknofest/target_point) alınmadı!",
-                throttle_duration_sec=2.0,
-            )
-            return
-
-        yaw_deg, pitch_deg = calculate_turret_angles(self.odom_pos, self.target_pos)
-        angle_msg = Vector3()
-        angle_msg.x = float(yaw_deg)
-        angle_msg.y = float(pitch_deg)
-        angle_msg.z = 0.0
-        self.laser_angle_pub.publish(angle_msg)
-
-    def target_point_callback(self, msg):
-        self.target_pos = (
-            float(msg.point.x),
-            float(msg.point.y),
-            float(msg.point.z),
-        )
 
     def reset_task(self):
         self.ramp_up_confirm_frames = 0
@@ -321,10 +262,9 @@ class LaserTarget(Node):
                 self.get_logger().warning("Atış duruş süresi doldu. Lazer açılıyor.")
 
         elif self.state == "LASER_ON":
-            # Laser on for laser_duration (1.2s) and publishing target angle
+            # Laser on for laser_duration (1.2s)
             self.publish_velocity(0.0, 0.0)
             self.publish_laser(True)
-            self.publish_laser_angle()
 
             if self.elapsed_in_state() >= self.laser_duration:
                 self.publish_laser(False)
@@ -364,7 +304,7 @@ class LaserTarget(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = LaserTarget()
+    node = RampNode()
 
     try:
         rclpy.spin(node)

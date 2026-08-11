@@ -12,7 +12,7 @@ class CmdSwitchNode(Node):
 
     Stage 5  -> /cone_avoid/cmd_vel
     Stage 6  -> /dynamic_obstacle/cmd_vel
-    Stage 8  -> /laser_target/cmd_vel
+    Stage 8  -> /ramp/cmd_vel
     Diğerleri -> /fallow_corridor/cmd_vel
     """
 
@@ -29,7 +29,7 @@ class CmdSwitchNode(Node):
         self.stage_topics = {
             5: "/cone_avoid/cmd_vel",
             6: "/dynamic_obstacle/cmd_vel",
-            8: "/laser_target/cmd_vel",
+            8: "/ramp/cmd_vel",
         }
 
         self.cmd_vel_pub = self.create_publisher(
@@ -59,10 +59,10 @@ class CmdSwitchNode(Node):
             10,
         )
 
-        self.laser_sub = self.create_subscription(
+        self.ramp_sub = self.create_subscription(
             Twist,
-            "/laser_target/cmd_vel",
-            self.laser_callback,
+            "/ramp/cmd_vel",
+            self.ramp_callback,
             10,
         )
 
@@ -130,7 +130,7 @@ class CmdSwitchNode(Node):
         if self.active_stage == 6:
             self.cmd_vel_pub.publish(msg)
 
-    def laser_callback(self, msg: Twist):
+    def ramp_callback(self, msg: Twist):
         if self.final_stop_latched:
             return
 
