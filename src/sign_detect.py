@@ -383,11 +383,6 @@ class SignDetector(Node):
             10,
         )
 
-        self.stop_pub = self.create_publisher(
-            Bool,
-            "/teknofest/stop_detected",
-            10,
-        )
         self.label_pub = self.create_publisher(
             String,
             "/teknofest/sign_label",
@@ -420,7 +415,6 @@ class SignDetector(Node):
         self.last_stage_change_x = None
         self.last_stage_change_y = None
 
-        self.stop_active = False
         self.final_stop_active = False
 
         self.last_radius = 0
@@ -474,7 +468,7 @@ class SignDetector(Node):
         )
 
     def _republish_saved_markers(self):
-        """1Hz timer callback: Kayıtlı tüm tabelaları RViz'e periyodik olarak yayınla."""
+        """1Hz timer callback: Kayıtlı tüm tabelaları (stage + stop) RViz'e periyodik olarak yayınla."""
         if not self.detected_signs:
             return
 
@@ -482,12 +476,19 @@ class SignDetector(Node):
         now_time = self.get_clock().now().to_msg()
         frame_id = "odom" if (self.odom_x is not None) else "base_link"
 
-        for stage_num, sdata in self.detected_signs.items():
+        for sign_key, sdata in self.detected_signs.items():
+            if isinstance(sign_key, int):
+                marker_id_base = sign_key * 10
+                label_text = f"{sdata['label']} (Stage {sign_key})"
+            else:
+                marker_id_base = 900
+                label_text = f"{sdata['label']} ({sign_key})"
+
             p_text = Marker()
             p_text.header.frame_id = frame_id
             p_text.header.stamp = now_time
             p_text.ns = "sign_map_text"
-            p_text.id = int(stage_num) * 10
+            p_text.id = marker_id_base
             p_text.type = Marker.TEXT_VIEW_FACING
             p_text.action = Marker.ADD
             p_text.pose.position.x = sdata["x"]
@@ -499,14 +500,15 @@ class SignDetector(Node):
             p_text.color.g = 0.9
             p_text.color.b = 1.0
             p_text.color.a = 1.0
-            p_text.text = f"{sdata['label']} (Stage {stage_num})"
+            p_text.text = label_text
+
             marker_array.markers.append(p_text)
 
             p_shape = Marker()
             p_shape.header.frame_id = frame_id
             p_shape.header.stamp = now_time
             p_shape.ns = "sign_map_shape"
-            p_shape.id = int(stage_num) * 10 + 1
+            p_shape.id = marker_id_base + 1
             p_shape.type = Marker.CYLINDER
             p_shape.action = Marker.ADD
             p_shape.pose.position.x = sdata["x"]
@@ -520,6 +522,7 @@ class SignDetector(Node):
             p_shape.color.g = 0.6
             p_shape.color.b = 1.0
             p_shape.color.a = 0.85
+
             marker_array.markers.append(p_shape)
 
         if marker_array.markers:
@@ -1052,7 +1055,6 @@ class SignDetector(Node):
             self.last_center = None
             self.current_matched_label = "none"
             self.current_match_score = 0.0
-            self.stop_active = False
             return
 
         best_candidate = candidates[0]
@@ -1060,7 +1062,6 @@ class SignDetector(Node):
         self.last_center = (int(best_candidate["cx"]), int(best_candidate["cy"]))
 
         top_matched = False
-        self.stop_active = False
 
         for candidate in candidates:
             matched_key = candidate.get("matched_key", None)
@@ -1078,28 +1079,31 @@ class SignDetector(Node):
                 self.current_match_score = match_score
                 top_matched = True
 
-            if matched_key == "sign_stop":
-                self.stop_active = True
-
             if tmpl_meta:
                 stage_num = tmpl_meta.get("stage_num", None)
-                if stage_num is not None and x_world is not None and y_world is not None:
-                    if stage_num not in self.detected_signs:
+                is_stop = tmpl_meta.get("is_stop", False) or (matched_key == "sign_stop")
+
+                sign_key = stage_num if stage_num is not None else ("STOP" if is_stop else None)
+
+                if sign_key is not None and x_world is not None and y_world is not None:
+                    if sign_key not in self.detected_signs:
                         # İlk tespit → konumu kaydet + marker ekle
-                        self.detected_signs[stage_num] = {
+                        self.detected_signs[sign_key] = {
                             "x": x_world,
                             "y": y_world,
                             "label": matched_key,
                             "score": match_score,
+                            "is_stop": is_stop,
                         }
+                        tag_desc = f"Stage {stage_num}" if stage_num is not None else "STOP Tabelası"
                         self.get_logger().info(
-                            f"[TABELA KONUMU KAYDEDİLDİ] Stage {stage_num} ({matched_key}) harita konumu kaydedildi: "
-                            f"({x_world:.2f}, {y_world:.2f}). Araç bu konuma ulaşınca stage değişecek."
+                            f"[TABELA KONUMU KAYDEDİLDİ] {tag_desc} ({matched_key}) harita konumu kaydedildi: "
+                            f"({x_world:.2f}, {y_world:.2f})."
                         )
                         self.publish_sign_marker(candidate)
                     else:
                         # Tekrar tespit → sadece konumu güncelle, yeni marker koyma
-                        old = self.detected_signs[stage_num]
+                        old = self.detected_signs[sign_key]
                         old["x"] = 0.70 * old["x"] + 0.30 * x_world
                         old["y"] = 0.70 * old["y"] + 0.30 * y_world
                         old["score"] = max(old["score"], match_score)
@@ -1141,54 +1145,56 @@ class SignDetector(Node):
                 else:
                     x_world, y_world, z_world = x_rel, y_rel, z_rel
 
-                label = matched_key if (matched_key and match_score >= self.template_match_threshold) else "Detected Sign"
+                is_matched = bool(matched_key and match_score >= self.template_match_threshold)
+                if is_matched or self.show_unmatched_candidates:
+                    label = matched_key if is_matched else "Detected Sign"
 
-                # Real-time active tracking text marker
-                track_text = Marker()
-                track_text.header.frame_id = frame_id
-                track_text.header.stamp = now_time
-                track_text.ns = "sign_realtime_text"
-                track_text.id = 9999
-                track_text.type = Marker.TEXT_VIEW_FACING
-                track_text.action = Marker.ADD
-                track_text.pose.position.x = x_world
-                track_text.pose.position.y = y_world
-                track_text.pose.position.z = z_world + 0.50
-                track_text.pose.orientation.x = 0.0
-                track_text.pose.orientation.y = 0.0
-                track_text.pose.orientation.z = 0.0
-                track_text.pose.orientation.w = 1.0
-                track_text.scale.z = 0.40
-                track_text.color.r = 0.0
-                track_text.color.g = 1.0
-                track_text.color.b = 0.3
-                track_text.color.a = 1.0
-                track_text.text = f"{label} ({match_score:.2f})" if matched_key else f"Candidate (r={radius}px)"
-                marker_array.markers.append(track_text)
+                    # Real-time active tracking text marker
+                    track_text = Marker()
+                    track_text.header.frame_id = frame_id
+                    track_text.header.stamp = now_time
+                    track_text.ns = "sign_realtime_text"
+                    track_text.id = 9999
+                    track_text.type = Marker.TEXT_VIEW_FACING
+                    track_text.action = Marker.ADD
+                    track_text.pose.position.x = x_world
+                    track_text.pose.position.y = y_world
+                    track_text.pose.position.z = z_world + 0.50
+                    track_text.pose.orientation.x = 0.0
+                    track_text.pose.orientation.y = 0.0
+                    track_text.pose.orientation.z = 0.0
+                    track_text.pose.orientation.w = 1.0
+                    track_text.scale.z = 0.40
+                    track_text.color.r = 0.0
+                    track_text.color.g = 1.0
+                    track_text.color.b = 0.3
+                    track_text.color.a = 1.0
+                    track_text.text = f"{label} ({match_score:.2f})" if matched_key else f"Candidate (r={radius}px)"
+                    marker_array.markers.append(track_text)
 
-                # Real-time active tracking shape marker
-                track_shape = Marker()
-                track_shape.header.frame_id = frame_id
-                track_shape.header.stamp = now_time
-                track_shape.ns = "sign_realtime_shape"
-                track_shape.id = 9998
-                track_shape.type = Marker.CYLINDER
-                track_shape.action = Marker.ADD
-                track_shape.pose.position.x = x_world
-                track_shape.pose.position.y = y_world
-                track_shape.pose.position.z = z_world
-                track_shape.pose.orientation.x = 0.0
-                track_shape.pose.orientation.y = 0.0
-                track_shape.pose.orientation.z = 0.0
-                track_shape.pose.orientation.w = 1.0
-                track_shape.scale.x = 0.45
-                track_shape.scale.y = 0.45
-                track_shape.scale.z = 0.50
-                track_shape.color.r = 1.0
-                track_shape.color.g = 0.2
-                track_shape.color.b = 0.2
-                track_shape.color.a = 0.85
-                marker_array.markers.append(track_shape)
+                    # Real-time active tracking shape marker
+                    track_shape = Marker()
+                    track_shape.header.frame_id = frame_id
+                    track_shape.header.stamp = now_time
+                    track_shape.ns = "sign_realtime_shape"
+                    track_shape.id = 9998
+                    track_shape.type = Marker.CYLINDER
+                    track_shape.action = Marker.ADD
+                    track_shape.pose.position.x = x_world
+                    track_shape.pose.position.y = y_world
+                    track_shape.pose.position.z = z_world
+                    track_shape.pose.orientation.x = 0.0
+                    track_shape.pose.orientation.y = 0.0
+                    track_shape.pose.orientation.z = 0.0
+                    track_shape.pose.orientation.w = 1.0
+                    track_shape.scale.x = 0.45
+                    track_shape.scale.y = 0.45
+                    track_shape.scale.z = 0.50
+                    track_shape.color.r = 1.0
+                    track_shape.color.g = 0.2
+                    track_shape.color.b = 0.2
+                    track_shape.color.a = 0.85
+                    marker_array.markers.append(track_shape)
 
         # Permanent markers for all saved detected signs
         for stage_num, sdata in self.detected_signs.items():
@@ -1241,10 +1247,6 @@ class SignDetector(Node):
             self.marker_pub.publish(marker_array)
 
     def publish_state(self):
-        stop_msg = Bool()
-        stop_msg.data = bool(self.stop_active)
-        self.stop_pub.publish(stop_msg)
-
         label_msg = String()
         label_msg.data = str(self.current_matched_label)
         self.label_pub.publish(label_msg)

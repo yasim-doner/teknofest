@@ -84,7 +84,6 @@ class LaserTarget(Node):
         self.pitch = 0.0
         self.odom_pos = (0.0, 0.0, 0.5)
 
-        self.stop_detected = False
         self.ramp_up_confirm_frames = 0
         self.flat_confirm_frames = 0
         self.descent_pitch_seen = False
@@ -140,12 +139,6 @@ class LaserTarget(Node):
             PointStamped,
             "/teknofest/target_point",
             self.target_point_callback,
-            10,
-        )
-        self.stop_sub = self.create_subscription(
-            Bool,
-            "/teknofest/stop_detected",
-            self.stop_callback,
             10,
         )
 
@@ -218,7 +211,6 @@ class LaserTarget(Node):
         )
 
     def reset_task(self):
-        self.stop_detected = False
         self.ramp_up_confirm_frames = 0
         self.flat_confirm_frames = 0
         self.descent_pitch_seen = False
@@ -280,9 +272,6 @@ class LaserTarget(Node):
             else:
                 self.descent_flat_frames = 0
 
-    def stop_callback(self, msg):
-        self.stop_detected = bool(msg.data)
-
     def control_loop(self):
         if self.current_stage != self.active_stage:
             self.publish_velocity(0.0, 0.0)
@@ -316,8 +305,8 @@ class LaserTarget(Node):
             self.publish_laser(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
-            # Reached top flat area or STOP sign detected
-            if self.stop_detected or self.flat_confirm_frames >= 4:
+            # Reached top flat area via IMU flat detection
+            if self.flat_confirm_frames >= 4:
                 self.publish_velocity(0.0, 0.0)
                 self.set_state("STOPPING_AT_TOP")
                 self.get_logger().warning("Rampa tepe düzlüğü algılandı. Atış için duruluyor.")
