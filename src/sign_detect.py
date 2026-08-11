@@ -1327,7 +1327,6 @@ class SignDetector(Node):
 
         status = (
             f"stage={self.stage_id} "
-            f"stop={int(self.stop_active)} "
             f"candidates={len(candidates) if candidates else 0} "
             f"match={matched_key} ({match_score:.2f}) "
             f"r={self.last_radius} "
