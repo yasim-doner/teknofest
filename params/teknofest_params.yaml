@@ -57,7 +57,7 @@ cone_avoid:
 dynamic_obstacle:
   ros__parameters:
     initial_stage: 0
-    target_speed: 0.25
+    target_speed: 0.45
     detection_min_x: 0.4
     detection_max_x: 2.2
     detection_y: 0.8
@@ -67,7 +67,7 @@ dynamic_obstacle:
     grid_cell_size: 0.2
     min_height_diff: 0.18
     min_points_threshold: 15
-    crossing_duration: 4.0
+    crossing_duration: 3.0
     kp_steering: 0.6
     max_angular_speed: 0.3
 

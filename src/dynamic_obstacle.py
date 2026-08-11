@@ -20,7 +20,7 @@ class DynamicObstacleNode(Node):
 
         # Declare parameters for tuning on the fly
         self.declare_parameter('initial_stage', 0)
-        self.declare_parameter('target_speed', 0.25)           # Target forward speed when path is clear (motor power)
+        self.declare_parameter('target_speed', 0.45)           # Target forward speed when path is clear (motor power)
         self.declare_parameter('detection_min_x', 0.4)         # Min distance ahead to detect obstacle (meters)
         self.declare_parameter('detection_max_x', 2.2)         # Max distance ahead to detect obstacle (meters)
         self.declare_parameter('detection_y', 0.8)             # Half-width of detection sector (meters)
@@ -32,15 +32,21 @@ class DynamicObstacleNode(Node):
         self.declare_parameter('grid_cell_size', 0.2)          # Grid size for local ground estimation (meters)
         self.declare_parameter('min_height_diff', 0.18)        # Height threshold above ground to count as obstacle (meters)
         self.declare_parameter('min_points_threshold', 15)     # Min points to consider obstacle present
-        self.declare_parameter('crossing_duration', 4.0)       # Seconds to move forward after obstacle clears
+        self.declare_parameter('crossing_duration', 3.0)       # Seconds to move forward after obstacle clears
         self.declare_parameter('kp_steering', 0.6)             # Proportional gain for gap centering
         self.declare_parameter('max_angular_speed', 0.3)       # Max angular velocity when steering towards gap
+        self.declare_parameter('min_moving_vel', 0.04)         # Min velocity (m/s) to determine obstacle movement direction
 
         # State variables for activation and passing
         initial_stage = int(self.get_parameter('initial_stage').value)
         self.is_active = (initial_stage == 6)
         self.clear_start_time = None
         self.last_target_y = 0.0
+        
+        # Obstacle motion tracking variables
+        self.prev_obstacle_mean_y = None
+        self.prev_obstacle_time = None
+        self.obstacle_vel_y = 0.0
 
         # Subscriptions & Publishers
         self.points_sub = self.create_subscription(
@@ -76,10 +82,16 @@ class DynamicObstacleNode(Node):
                 self.is_active = True
                 self.clear_start_time = None
                 self.last_target_y = 0.0
+                self.prev_obstacle_mean_y = None
+                self.prev_obstacle_time = None
+                self.obstacle_vel_y = 0.0
                 self.get_logger().info("Dynamic obstacle node ACTIVATED for Stage 6.")
         else:
             if self.is_active:
                 self.is_active = False
+                self.prev_obstacle_mean_y = None
+                self.prev_obstacle_time = None
+                self.obstacle_vel_y = 0.0
                 self.get_logger().info("Dynamic obstacle node DEACTIVATED.")
 
     def pointcloud_callback(self, msg: PointCloud2):
@@ -162,36 +174,58 @@ class DynamicObstacleNode(Node):
                 if (pt[2] - min_z_val) >= min_height_diff:
                     obstacle_pts.append(pt)
 
-        # 3. Decision Logic: Check for a clear vehicle passage window
-        # Check direct front corridor first
-        direct_pts = [p for p in obstacle_pts if abs(p[1]) <= vehicle_half_width]
+        # 3. Obstacle Movement Direction Estimation (in Y axis)
+        now_time = self.get_clock().now()
+        min_moving_vel = self.get_parameter('min_moving_vel').value
 
+        if len(obstacle_pts) >= min_points_threshold:
+            current_mean_y = float(np.mean([p[1] for p in obstacle_pts]))
+            if self.prev_obstacle_mean_y is not None and self.prev_obstacle_time is not None:
+                dt = (now_time - self.prev_obstacle_time).nanoseconds / 1e9
+                if dt > 0.02:
+                    raw_vel = (current_mean_y - self.prev_obstacle_mean_y) / dt
+                    self.obstacle_vel_y = 0.7 * self.obstacle_vel_y + 0.3 * raw_vel
+            self.prev_obstacle_mean_y = current_mean_y
+            self.prev_obstacle_time = now_time
+        else:
+            self.prev_obstacle_mean_y = None
+            self.prev_obstacle_time = None
+            self.obstacle_vel_y = 0.0
+
+        moving_right = (self.obstacle_vel_y > min_moving_vel)   # Moving towards +Y (Right)
+        moving_left = (self.obstacle_vel_y < -min_moving_vel)   # Moving towards -Y (Left)
+
+        # 4. Decision Logic: Check for a clear vehicle passage window on the SAFE side
         target_y = 0.0
         passage_found = False
 
-        if len(direct_pts) < min_points_threshold:
-            # Direct front path is clear
-            passage_found = True
-            target_y = 0.0
-        else:
-            # Direct path blocked: scan for an open lateral gap of vehicle width
-            min_y_search = -detection_y + vehicle_half_width
-            max_y_search = detection_y - vehicle_half_width
+        min_y_search = -detection_y + vehicle_half_width
+        max_y_search = detection_y - vehicle_half_width
 
-            if min_y_search < max_y_search:
-                y_candidates = np.arange(min_y_search, max_y_search + 0.05, 0.05)
-                best_y = 0.0
-                min_pts_in_gap = float('inf')
+        # Filter search corridor to avoid the side the obstacle is moving TOWARDS
+        if moving_right:
+            # Obstacle is moving towards +Y (right). Safe side is -Y (left).
+            max_y_search = min(max_y_search, 0.0)
+            self.get_logger().info(f"[ENGEL SAĞA GİDİYOR v={self.obstacle_vel_y:.2f}m/s] Sol taraf (-Y) taranıyor.", throttle_duration_sec=0.5)
+        elif moving_left:
+            # Obstacle is moving towards -Y (left). Safe side is +Y (right).
+            min_y_search = max(min_y_search, 0.0)
+            self.get_logger().info(f"[ENGEL SOLA GİDİYOR v={self.obstacle_vel_y:.2f}m/s] Sağ taraf (+Y) taranıyor.", throttle_duration_sec=0.5)
 
-                for y_cand in y_candidates:
-                    gap_pts_count = sum(1 for p in obstacle_pts if abs(p[1] - y_cand) <= vehicle_half_width)
-                    if gap_pts_count < min_pts_in_gap:
-                        min_pts_in_gap = gap_pts_count
-                        best_y = y_cand
+        if min_y_search <= max_y_search:
+            y_candidates = np.arange(min_y_search, max_y_search + 0.05, 0.05)
+            best_y = 0.0
+            min_pts_in_gap = float('inf')
 
-                if min_pts_in_gap < min_points_threshold:
-                    passage_found = True
-                    target_y = float(best_y)
+            for y_cand in y_candidates:
+                gap_pts_count = sum(1 for p in obstacle_pts if abs(p[1] - y_cand) <= vehicle_half_width)
+                if gap_pts_count < min_pts_in_gap:
+                    min_pts_in_gap = gap_pts_count
+                    best_y = y_cand
+
+            if min_pts_in_gap < min_points_threshold:
+                passage_found = True
+                target_y = float(best_y)
 
         self.last_target_y = target_y
 
