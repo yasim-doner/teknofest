@@ -77,6 +77,10 @@ class DynamicObstacleNode(Node):
                 self.clear_start_time = None
                 self.last_target_y = 0.0
                 self.get_logger().info("Dynamic obstacle node ACTIVATED for Stage 6.")
+        else:
+            if self.is_active:
+                self.is_active = False
+                self.get_logger().info("Dynamic obstacle node DEACTIVATED.")
 
     def pointcloud_callback(self, msg: PointCloud2):
         if not self.is_active:

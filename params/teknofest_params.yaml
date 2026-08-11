@@ -56,7 +56,7 @@ cone_avoid:
 
 dynamic_obstacle:
   ros__parameters:
-    initial_stage: 6
+    initial_stage: 0
     target_speed: 0.25
     detection_min_x: 0.4
     detection_max_x: 2.2
@@ -76,7 +76,7 @@ sign_detect:
     image_topic: "/rover/camera/image_raw"
     textures_dir: "/home/myazou/rover_ws/src/teknofest/textures"
     use_template_matching: true
-    template_match_threshold: 0.40
+    template_match_threshold: 0.65
     show_unmatched_candidates: false
     real_sign_diameter: 0.60
     enable_physical_size_filter: true
