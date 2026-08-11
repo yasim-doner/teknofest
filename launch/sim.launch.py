@@ -142,53 +142,6 @@ def launch_setup(context, *args, **kwargs):
             {
                 "use_sim_time": True,
                 "initial_stage": stage,
-                "image_topic": "/rover/camera/image_raw",
-
-                # Hafif connected-components algılama ayarları.
-                "min_component_area": 30,
-                "max_component_area_ratio": 0.15,
-                "min_candidate_size": 8,
-                "max_candidate_size": 220,
-                "min_aspect": 0.45,
-                "max_aspect": 1.75,
-                "min_white_ratio": 0.08,
-                "min_red_fill_ratio": 0.02,
-
-                # Fiziksel levha yaklaşma / uzaklaşma eşikleri.
-                "enter_radius": 14,
-                "exit_radius": 9,
-                "enter_frames": 2,
-                "exit_frames": 3,
-
-                # Alt bölümdeki konileri stage levhası sayma.
-                "max_stage_candidate_y_ratio": 0.78,
-                "upper_enter_radius": 10,
-
-                # Stage 5 -> 6 ve Stage 6 -> 7 için simülasyon yedeği.
-                "use_odom_fallback": True,
-                "stage5_to6_x": 12.5,
-                "stage5_lane_y": 10.0,
-                "stage5_lane_tolerance": 3.0,
-                "stage6_to7_min_x": 15.0,
-                "stage6_to7_y": 17.0,
-
-                # Stage 8 sonrasında sonraki yakın levha STOP kabul edilir.
-                "stop_guard_seconds": 3.0,
-                "diagnostic_every_frames": 5,
-
-                # Art arda stage'lerin aynı nesneden üretilmesini engeller.
-                "min_stage_travel_distance": 1.5,
-                "min_stage_interval_seconds": 2.0,
-
-                # Sıradaki stage'in gerçek parkur konumuna yaklaşmadan
-                # stage artırılmaz.
-                "use_stage_geofence": True,
-                "stage_geofence_radius": 3.0,
-
-                # Normal Teknofest parkuru Stage 10'da biter.
-                # Stage 11 ayrı hızlanma parkurudur.
-                "final_stage": 10,
-                "stop_after_final_stage": True,
             },
         ],
     )
@@ -203,30 +156,7 @@ def launch_setup(context, *args, **kwargs):
             params_file_path,
             {
                 "use_sim_time": True,
-                "active_stage": 8,
                 "initial_stage": stage,
-                "approach_speed": 0.35,
-                "ramp_speed": 0.45,
-                "ramp_boost_speed": 0.55,
-                "ramp_boost_delay": 2.0,
-
-                # Rampa algılandıktan sonra rover rampanın üzerinde
-                # tamamen hareketsiz bekler, sonra çıkmaya devam eder.
-                "ramp_pause_duration": 2.0,
-
-                # Rampa algılandıktan sonra yaklaşık 20 cm daha ilerler,
-                # ardından rampanın üzerinde 2 saniye bekler.
-                "ramp_creep_duration": 3.0,
-                "ramp_creep_speed": 0.25,
-
-                "search_speed": 0.08,
-                "ramp_pitch_threshold_deg": 8.0,
-                "flat_pitch_threshold_deg": 3.0,
-                "ramp_confirm_frames": 5,
-                "flat_confirm_frames": 12,
-                "stop_sign_wait_timeout": 2.0,
-                "stop_duration": 2.2,
-                "laser_duration": 1.2,
             },
         ],
     )

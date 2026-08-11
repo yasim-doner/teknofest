@@ -70,10 +70,45 @@ dynamic_obstacle:
 sign_detect:
   ros__parameters:
     image_topic: "/rover/camera/image_raw"
-    min_confidence: 0.18
-    min_margin: 0.015
-    stable_frames: 3
-    lost_frames: 5
-    min_candidate_size: 12
-    max_candidate_size: 60
-    max_candidates: 5
+    textures_dir: "/home/myazou/rover_ws/src/teknofest/textures"
+    use_template_matching: true
+    template_match_threshold: 0.40
+    show_unmatched_candidates: false
+    real_sign_diameter: 0.60
+    enable_physical_size_filter: true
+    min_sign_diameter: 0.35
+    max_sign_diameter: 0.85
+    min_component_area: 30
+    max_component_area_ratio: 0.15
+    min_candidate_size: 8
+    max_candidate_size: 220
+    min_aspect: 0.45
+    max_aspect: 1.75
+    min_white_ratio: 0.08
+    min_red_fill_ratio: 0.02
+    enter_radius: 14
+    exit_radius: 9
+    enter_frames: 2
+    exit_frames: 3
+    max_stage_candidate_y_ratio: 0.78
+    upper_enter_radius: 10
+    stop_guard_seconds: 3.0
+    diagnostic_every_frames: 5
+    min_stage_travel_distance: 1.5
+    min_stage_interval_seconds: 2.0
+    use_stage_geofence: true
+    stage_geofence_radius: 3.0
+    use_odom_fallback: true
+    odom_fallback_radius: 2.5
+    final_stage: 10
+    stop_after_final_stage: true
+
+laser_target:
+  ros__parameters:
+    active_stage: 8
+    drive_speed: 0.35
+    ramp_pitch_threshold_deg: 8.0
+    flat_pitch_threshold_deg: 3.0
+    flat_drive_duration: 1.0
+    stop_duration: 2.0
+    laser_duration: 1.2
