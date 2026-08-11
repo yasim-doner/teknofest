@@ -5,6 +5,7 @@ import rclpy
 from geometry_msgs.msg import PointStamped, Twist, Vector3
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Bool, Int32
 
@@ -125,7 +126,7 @@ class LaserTarget(Node):
             Imu,
             "/rover/imu",
             self.imu_callback,
-            10,
+            qos_profile_sensor_data,
         )
         self.odom_sub = self.create_subscription(
             Odometry,

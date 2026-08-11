@@ -3,6 +3,7 @@ import sys
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import PointCloud2, Imu
 from sensor_msgs_py import point_cloud2 as pc2
@@ -55,13 +56,13 @@ class FallowCorridorNode(Node):
             PointCloud2,
             '/rover/points',
             self.pointcloud_callback,
-            10
+            qos_profile_sensor_data
         )
         self.imu_sub = self.create_subscription(
             Imu,
             '/rover/imu',
             self.imu_callback,
-            10
+            qos_profile_sensor_data
         )
         self.cmd_vel_pub = self.create_publisher(
             Twist,
