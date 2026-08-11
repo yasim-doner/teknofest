@@ -36,17 +36,17 @@ def calculate_turret_angles(p_laser, p_target):
 
 class LaserTarget(Node):
     """
-    Stage 8 rampa + lazer görevi (Sadeleştirilmiş).
+    Stage 8 rampa + lazer görevi.
 
     Çalışma sırası:
-    1. /teknofest/stage_id == 8 olana kadar bekler.
-    2. Sabit bir hızla (drive_speed) doğrudan düz ilerler.
-    3. IMU ile rampaya çıktığını ve ardından düzlüğe ulaştığını tespit eder.
-    4. Düzlüğe ulaştığında veya STOP tabelası görüldüğünde durur.
-    5. 2 saniye durup 1.2 saniye lazer yakar.
-    6. Lazer açıkken kameradan gelen hedef noktasına (/teknofest/target_point) göre
-       hesaplanan yaw ve pitch (derece) açılarını /laser_angle üzerinden yayınlar.
-    7. Lazer bittiğinde /teknofest/laser_on = False yapar ve /teknofest/release = 8 yayınlar.
+    1. /teknofest/stage_id == 8 olana kadar bekler (APPROACH_RAMP).
+    2. Rampaya çıkış algılandığında (pitch >= 8°) 2s durur (RAMP_UP_STOP).
+    3. Rampayı tırmanır (CLIMBING_RAMP).
+    4. Düzlüğe ulaşıldığında veya STOP tabelası görüldüğünde durur (STOPPING_AT_TOP - 2s).
+    5. 1.2 saniye lazer yakar (LASER_ON) ve /laser_angle yayınlar.
+    6. Rampadan aşağı iner (DESCENDING_RAMP).
+    7. İniş tamamlandığında 2s durur (RAMP_DOWN_STOP).
+    8. /teknofest/release = 8 yayınlar (DONE).
     """
 
     def __init__(self):
@@ -85,11 +85,13 @@ class LaserTarget(Node):
         self.odom_pos = (0.0, 0.0, 0.5)
 
         self.stop_detected = False
-        self.ramp_detected = False
+        self.ramp_up_confirm_frames = 0
         self.flat_confirm_frames = 0
-        self.flat_drive_start_time = None
+        self.descent_pitch_seen = False
+        self.descent_flat_frames = 0
+
         self.state = (
-            "DRIVING"
+            "APPROACH_RAMP"
             if self.current_stage == self.active_stage
             else "WAIT_STAGE"
         )
@@ -153,7 +155,7 @@ class LaserTarget(Node):
         )
 
         self.get_logger().info(
-            f"=== Stage 8 Laser Target Node başladı (Hız={self.drive_speed} m/s) ==="
+            f"=== Stage 8 Laser Target Node başladı (Hız={self.drive_speed} m/s, Durma={self.stop_duration}s) ==="
         )
 
     def now_seconds(self):
@@ -217,11 +219,12 @@ class LaserTarget(Node):
 
     def reset_task(self):
         self.stop_detected = False
-        self.ramp_detected = False
+        self.ramp_up_confirm_frames = 0
         self.flat_confirm_frames = 0
-        self.flat_drive_start_time = None
+        self.descent_pitch_seen = False
+        self.descent_flat_frames = 0
 
-        self.publish_velocity()
+        self.publish_velocity(0.0, 0.0)
         self.publish_laser(False)
         self.set_state("WAIT_STAGE")
 
@@ -235,8 +238,8 @@ class LaserTarget(Node):
             and previous_stage != self.active_stage
         ):
             self.reset_task()
-            self.set_state("DRIVING")
-            self.get_logger().info("Stage 8 aktif: Sürüş başladı.")
+            self.set_state("APPROACH_RAMP")
+            self.get_logger().info("Stage 8 aktif: Rampa yaklaşımı başladı.")
 
         elif (
             self.current_stage != self.active_stage
@@ -255,62 +258,114 @@ class LaserTarget(Node):
         self.pitch = self.quaternion_to_pitch(msg)
         abs_pitch = abs(self.pitch)
 
+        # Ramp up pitch check
         if abs_pitch >= self.ramp_pitch_threshold:
-            self.ramp_detected = True
+            self.ramp_up_confirm_frames += 1
+        else:
+            self.ramp_up_confirm_frames = 0
 
-        if self.ramp_detected and abs_pitch <= self.flat_pitch_threshold:
+        # Flat pitch check after climbing
+        if self.state == "CLIMBING_RAMP" and abs_pitch <= self.flat_pitch_threshold:
             self.flat_confirm_frames += 1
         else:
             self.flat_confirm_frames = 0
+
+        # Flat pitch check after descending
+        if self.state == "DESCENDING_RAMP":
+            if abs_pitch >= self.ramp_pitch_threshold:
+                self.descent_pitch_seen = True
+
+            if self.descent_pitch_seen and abs_pitch <= self.flat_pitch_threshold:
+                self.descent_flat_frames += 1
+            else:
+                self.descent_flat_frames = 0
 
     def stop_callback(self, msg):
         self.stop_detected = bool(msg.data)
 
     def control_loop(self):
         if self.current_stage != self.active_stage:
-            self.publish_velocity()
+            self.publish_velocity(0.0, 0.0)
             self.publish_laser(False)
             return
 
-        if self.state == "DRIVING":
+        if self.state == "APPROACH_RAMP":
+            # Driving towards ramp
             self.publish_laser(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
-            if self.stop_detected or self.flat_confirm_frames >= 5:
-                if self.flat_drive_start_time is None:
-                    self.flat_drive_start_time = self.now_seconds()
-                    reason = "STOP tabelası" if self.stop_detected else "Rampa bitti, düz zemin"
-                    self.get_logger().warning(
-                        f"{reason} algılandı. {self.flat_drive_duration:.1f}s daha sürüşe devam ediliyor."
-                    )
+            # Ramp climb detected (pitch >= threshold)
+            if self.ramp_up_confirm_frames >= 2 or abs(self.pitch) >= self.ramp_pitch_threshold:
+                self.publish_velocity(0.0, 0.0)
+                self.set_state("RAMP_UP_STOP")
+                self.get_logger().warning(
+                    f"Rampa çıkışı algılandı (Pitch={math.degrees(self.pitch):.1f}°). {self.stop_duration}s duruluyor."
+                )
 
-                if self.now_seconds() - self.flat_drive_start_time >= self.flat_drive_duration:
-                    self.publish_velocity(linear_x=0.0)
-                    self.set_state("STOPPING")
-                    self.get_logger().warning(
-                        f"Düzlükteki {self.flat_drive_duration:.1f}s sürüş tamamlandı. Rover durduruldu."
-                    )
+        elif self.state == "RAMP_UP_STOP":
+            # 2 second stop at ramp start (climbing)
+            self.publish_velocity(0.0, 0.0)
+            self.publish_laser(False)
 
-        elif self.state == "STOPPING":
-            self.publish_velocity(linear_x=0.0)
+            if self.elapsed_in_state() >= self.stop_duration:
+                self.set_state("CLIMBING_RAMP")
+                self.get_logger().info("Rampa çıkış duruşu tamamlandı. Tırmanış başladı.")
+
+        elif self.state == "CLIMBING_RAMP":
+            # Climbing ramp towards the top flat area
+            self.publish_laser(False)
+            self.publish_velocity(linear_x=self.drive_speed)
+
+            # Reached top flat area or STOP sign detected
+            if self.stop_detected or self.flat_confirm_frames >= 4:
+                self.publish_velocity(0.0, 0.0)
+                self.set_state("STOPPING_AT_TOP")
+                self.get_logger().warning("Rampa tepe düzlüğü algılandı. Atış için duruluyor.")
+
+        elif self.state == "STOPPING_AT_TOP":
+            # 2 second stop at top for laser task
+            self.publish_velocity(0.0, 0.0)
             self.publish_laser(False)
 
             if self.elapsed_in_state() >= self.stop_duration:
                 self.set_state("LASER_ON")
-                self.get_logger().warning("Duruş süresi doldu. Lazer açılıyor.")
+                self.get_logger().warning("Atış duruş süresi doldu. Lazer açılıyor.")
 
         elif self.state == "LASER_ON":
-            self.publish_velocity(linear_x=0.0)
+            # Laser on for laser_duration (1.2s) and publishing target angle
+            self.publish_velocity(0.0, 0.0)
             self.publish_laser(True)
             self.publish_laser_angle()
 
             if self.elapsed_in_state() >= self.laser_duration:
                 self.publish_laser(False)
+                self.descent_pitch_seen = False
+                self.descent_flat_frames = 0
+                self.set_state("DESCENDING_RAMP")
+                self.get_logger().info("Lazer görevi tamamlandı. Rampadan iniliyor.")
+
+        elif self.state == "DESCENDING_RAMP":
+            # Driving forward down the ramp
+            self.publish_laser(False)
+            self.publish_velocity(linear_x=self.drive_speed)
+
+            # Check if descent slope finished or timeout reached
+            if self.descent_flat_frames >= 4 or self.elapsed_in_state() >= 4.0:
+                self.publish_velocity(0.0, 0.0)
+                self.set_state("RAMP_DOWN_STOP")
+                self.get_logger().warning(f"Rampadan iniş tamamlandı. {self.stop_duration}s duruluyor.")
+
+        elif self.state == "RAMP_DOWN_STOP":
+            # 2 second stop after descending ramp
+            self.publish_velocity(0.0, 0.0)
+            self.publish_laser(False)
+
+            if self.elapsed_in_state() >= self.stop_duration:
                 self.set_state("DONE")
-                self.get_logger().info("Lazer süresi doldu. Görev tamamlandı.")
+                self.get_logger().info("Rampa iniş duruşu tamamlandı. Stage 8 görevi bitti.")
 
         elif self.state == "DONE":
-            self.publish_velocity(linear_x=0.0)
+            self.publish_velocity(0.0, 0.0)
             self.publish_laser(False)
 
             release_msg = Int32()
