@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import glob
+import json
 import math
 import os
 import time
@@ -82,14 +83,6 @@ class SignDetector(Node):
 
         self.declare_parameter("stop_guard_seconds", 3.0)
         self.declare_parameter("diagnostic_every_frames", 5)
-        self.declare_parameter("min_stage_travel_distance", 1.5)
-        self.declare_parameter("min_stage_interval_seconds", 2.0)
-        self.declare_parameter("use_stage_geofence", True)
-        self.declare_parameter("stage_geofence_radius", 3.0)
-        self.declare_parameter("use_odom_fallback", True)
-        self.declare_parameter("odom_fallback_radius", 2.5)
-        self.declare_parameter("final_stage", 10)
-        self.declare_parameter("stop_after_final_stage", True)
 
         # Görüntünün alt kısmındaki koniler stage levhası değildir.
         self.declare_parameter("max_stage_candidate_y_ratio", 0.78)
@@ -220,67 +213,7 @@ class SignDetector(Node):
             ),
         )
 
-        self.min_stage_travel_distance = max(
-            0.0,
-            float(
-                self.get_parameter(
-                    "min_stage_travel_distance"
-                ).value
-            ),
-        )
-        self.min_stage_interval_seconds = max(
-            0.0,
-            float(
-                self.get_parameter(
-                    "min_stage_interval_seconds"
-                ).value
-            ),
-        )
-
-        self.use_stage_geofence = bool(
-            self.get_parameter(
-                "use_stage_geofence"
-            ).value
-        )
-        self.stage_geofence_radius = max(
-            0.5,
-            float(
-                self.get_parameter(
-                    "stage_geofence_radius"
-                ).value
-            ),
-        )
-
-        self.use_odom_fallback = bool(
-            self.get_parameter(
-                "use_odom_fallback"
-            ).value
-        )
-        self.odom_fallback_radius = max(
-            0.5,
-            float(
-                self.get_parameter(
-                    "odom_fallback_radius"
-                ).value
-            ),
-        )
-
-        self.final_stage = max(
-            1,
-            min(
-                11,
-                int(
-                    self.get_parameter(
-                        "final_stage"
-                    ).value
-                ),
-            ),
-        )
-        self.stop_after_final_stage = bool(
-            self.get_parameter(
-                "stop_after_final_stage"
-            ).value
-        )
+        # Görüntünün alt kısmındaki koniler stage levhası değildir.
 
         self.max_stage_candidate_y_ratio = float(
             self.get_parameter(
@@ -372,14 +305,9 @@ class SignDetector(Node):
             10,
         )
 
-        self.stage_pub = self.create_publisher(
-            Int32,
-            "/teknofest/stage_id",
-            10,
-        )
-        self.stage_order_pub = self.create_publisher(
-            Int32,
-            "/teknofest/stage_order",
+        self.sign_detected_pub = self.create_publisher(
+            String,
+            "/teknofest/sign_detected",
             10,
         )
 
@@ -402,11 +330,6 @@ class SignDetector(Node):
             Image,
             "/teknofest/sign_debug_image",
             self.debug_qos,
-        )
-        self.final_stop_pub = self.create_publisher(
-            Bool,
-            "/teknofest/final_stop",
-            10,
         )
 
         self.frame_count = 0
@@ -445,17 +368,11 @@ class SignDetector(Node):
         )
         self.get_logger().info(
             f"Kamera={self.image_topic}, "
-            f"başlangıç_stage={self.stage_id}, "
+            f"mevcut_stage={self.stage_id}, "
             f"enter={self.enter_radius}px, "
             f"exit={self.exit_radius}px, "
             f"üst_enter={self.upper_enter_radius}px, "
             f"üst_y_oranı={self.max_stage_candidate_y_ratio:.2f}, "
-            f"min_stage_mesafe={self.min_stage_travel_distance:.1f}m, "
-            f"min_stage_süre={self.min_stage_interval_seconds:.1f}s, "
-            f"stage_geofence={self.stage_geofence_radius:.1f}m, "
-            f"odom_fallback={self.use_odom_fallback} ({self.odom_fallback_radius:.1f}m), "
-            f"final_stage={self.final_stage}, "
-            f"final_duruş={self.stop_after_final_stage}, "
             "kamera_QoS=RELIABLE"
         )
 
@@ -477,8 +394,8 @@ class SignDetector(Node):
         frame_id = "odom" if (self.odom_x is not None) else "base_link"
 
         for sign_key, sdata in self.detected_signs.items():
-            if isinstance(sign_key, int):
-                marker_id_base = sign_key * 10
+            if isinstance(sign_key, int) or (isinstance(sign_key, str) and sign_key.isdigit()):
+                marker_id_base = int(sign_key) * 10
                 label_text = f"{sdata['label']} (Stage {sign_key})"
             else:
                 marker_id_base = 900
@@ -814,211 +731,13 @@ class SignDetector(Node):
         ):
             return None
 
-        dx = self.odom_x - self.last_stage_change_x
-        dy = self.odom_y - self.last_stage_change_y
-
-        return math.hypot(dx, dy)
-
-    def distance_to_expected_stage(
-        self,
-        stage_id,
-    ):
-        target = self.STAGE_POSITIONS.get(
-            int(stage_id)
-        )
-
-        if (
-            target is None
-            or self.odom_x is None
-            or self.odom_y is None
-        ):
-            return None
-
-        target_x, target_y = target
-
-        return math.hypot(
-            self.odom_x - target_x,
-            self.odom_y - target_y,
-        )
-
-    def stage_interval_seconds(self):
-        if self.last_stage_change_time is None:
-            return None
-
-        return (
-            self.now_seconds()
-            - self.last_stage_change_time
-        )
-
-    def stage_change_allowed(self, target_stage=None):
-        if target_stage is None:
-            target_stage = min(
-                self.stage_id + 1,
-                11,
-            )
-
-        distance = self.stage_travel_distance()
-        interval = self.stage_interval_seconds()
-        target_distance = (
-            self.distance_to_expected_stage(
-                target_stage
-            )
-        )
-
-        distance_ok = (
-            self.stage_id == 0
-            or distance is None
-            or distance
-            >= self.min_stage_travel_distance
-        )
-
-        interval_ok = (
-            self.stage_id == 0
-            or interval is None
-            or interval
-            >= self.min_stage_interval_seconds
-        )
-
-        geofence_ok = (
-            not self.use_stage_geofence
-            or target_distance is None
-            or target_distance
-            <= self.stage_geofence_radius
-        )
-
-        target_text = (
-            "bilinmiyor"
-            if target_distance is None
-            else f"{target_distance:.2f}m"
-        )
-
-        if (
-            distance_ok
-            and interval_ok
-            and geofence_ok
-        ):
-            return True, (
-                f"son_stage_mesafe="
-                f"{distance if distance is not None else -1.0:.2f}m, "
-                f"süre="
-                f"{interval if interval is not None else -1.0:.2f}s, "
-                f"stage_{target_stage}_uzaklık="
-                f"{target_text}"
-            )
-
-        return False, (
-            f"son_stage_mesafe="
-            f"{distance if distance is not None else -1.0:.2f}m/"
-            f"{self.min_stage_travel_distance:.2f}m, "
-            f"süre="
-            f"{interval if interval is not None else -1.0:.2f}s/"
-            f"{self.min_stage_interval_seconds:.2f}s, "
-            f"stage_{target_stage}_uzaklık="
-            f"{target_text}/"
-            f"{self.stage_geofence_radius:.2f}m"
-        )
-
-    def record_stage_change(self):
-        self.last_stage_change_time = (
-            self.now_seconds()
-        )
-
-        if (
-            self.odom_x is not None
-            and self.odom_y is not None
-        ):
-            self.last_stage_change_x = self.odom_x
-            self.last_stage_change_y = self.odom_y
-
     def stage_callback(self, msg):
         self.stage_id = int(msg.data)
-
-    def force_stage(self, new_stage, reason):
-        new_stage = int(new_stage)
-        if new_stage <= self.stage_id:
-            return
-
-        old_stage = self.stage_id
-        self.stage_id = min(self.final_stage, new_stage)
-        self.record_stage_change()
-
-        self.get_logger().warning(
-            f"Odometri Yedeği (Odom Fallback): "
-            f"stage_{old_stage} -> stage_{self.stage_id}. Neden: {reason}"
-        )
-        self.publish_stage()
-
-    def check_stage_progression(self):
-        if self.odom_x is None or self.odom_y is None:
-            return
-
-        if self.stage_id >= self.final_stage:
-            return
-
-        interval = self.stage_interval_seconds()
-        if interval is not None and self.stage_id > 0 and interval < self.min_stage_interval_seconds:
-            return
-
-        travel_dist = self.stage_travel_distance()
-        if travel_dist is not None and self.stage_id > 0 and travel_dist < self.min_stage_travel_distance:
-            return
-
-        next_stage = self.stage_id + 1
-
-        target_x, target_y = None, None
-        source_desc = ""
-
-        if next_stage in self.detected_signs:
-            sign_info = self.detected_signs[next_stage]
-            target_x = sign_info["x"]
-            target_y = sign_info["y"]
-            source_desc = f"Algılanan Tabela ({sign_info['label']})"
-        elif next_stage in self.STAGE_POSITIONS:
-            target_x, target_y = self.STAGE_POSITIONS[next_stage]
-            source_desc = "Varsayılan Stage Konumu"
-
-        if target_x is not None and target_y is not None:
-            dist = math.hypot(self.odom_x - target_x, self.odom_y - target_y)
-            threshold = self.odom_fallback_radius
-
-            if dist <= threshold:
-                old_stage = self.stage_id
-                self.stage_id = min(self.final_stage, next_stage)
-                self.record_stage_change()
-                self.get_logger().info(
-                    f"[STAGE GEÇİŞİ] Araç Stage {self.stage_id} konumuna ulaştı/geçti ({source_desc}): "
-                    f"Stage {old_stage} -> {self.stage_id} (Konum: ({target_x:.2f}, {target_y:.2f}), Mesafe: {dist:.2f}m <= {threshold:.2f}m)"
-                )
-                self.publish_stage()
-
-                if self.stage_id >= self.final_stage:
-                    self.final_stop_active = True
-                    self.publish_final_stop()
-
-    def publish_stage(self):
-        stage_msg = Int32()
-        stage_msg.data = int(self.stage_id)
-        self.stage_pub.publish(stage_msg)
-
-        order_msg = Int32()
-        order_msg.data = int(self.stage_id)
-        self.stage_order_pub.publish(order_msg)
 
     def odom_callback(self, msg):
         self.odom_x = float(msg.pose.pose.position.x)
         self.odom_y = float(msg.pose.pose.position.y)
         self.odom_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
-
-        if self.last_stage_change_x is None:
-            self.last_stage_change_x = self.odom_x
-            self.last_stage_change_y = self.odom_y
-
-        self.check_stage_progression()
-
-    def publish_final_stop(self):
-        msg = Bool()
-        msg.data = True
-        self.final_stop_pub.publish(msg)
 
     def estimate_candidate_position(self, candidate):
         if candidate is None:
@@ -1086,6 +805,19 @@ class SignDetector(Node):
                 sign_key = stage_num if stage_num is not None else ("STOP" if is_stop else None)
 
                 if sign_key is not None and x_world is not None and y_world is not None:
+                    payload = {
+                        "sign_key": str(sign_key),
+                        "stage_num": stage_num,
+                        "is_stop": is_stop,
+                        "label": matched_key,
+                        "x": float(x_world),
+                        "y": float(y_world),
+                        "score": float(match_score),
+                    }
+                    sign_msg = String()
+                    sign_msg.data = json.dumps(payload)
+                    self.sign_detected_pub.publish(sign_msg)
+
                     if sign_key not in self.detected_signs:
                         # İlk tespit → konumu kaydet + marker ekle
                         self.detected_signs[sign_key] = {
@@ -1198,11 +930,18 @@ class SignDetector(Node):
 
         # Permanent markers for all saved detected signs
         for stage_num, sdata in self.detected_signs.items():
+            if isinstance(stage_num, int) or (isinstance(stage_num, str) and stage_num.isdigit()):
+                marker_id_base = int(stage_num) * 10
+                label_text = f"{sdata['label']} (Stage {stage_num})"
+            else:
+                marker_id_base = 900
+                label_text = f"{sdata['label']} ({stage_num})"
+
             p_text = Marker()
             p_text.header.frame_id = frame_id
             p_text.header.stamp = now_time
             p_text.ns = "sign_map_text"
-            p_text.id = int(stage_num) * 10
+            p_text.id = marker_id_base
             p_text.type = Marker.TEXT_VIEW_FACING
             p_text.action = Marker.ADD
             p_text.pose.position.x = sdata["x"]
@@ -1217,14 +956,14 @@ class SignDetector(Node):
             p_text.color.g = 0.9
             p_text.color.b = 1.0
             p_text.color.a = 1.0
-            p_text.text = f"{sdata['label']} (Stage {stage_num})"
+            p_text.text = label_text
             marker_array.markers.append(p_text)
 
             p_shape = Marker()
             p_shape.header.frame_id = frame_id
             p_shape.header.stamp = now_time
             p_shape.ns = "sign_map_shape"
-            p_shape.id = int(stage_num) * 10 + 1
+            p_shape.id = marker_id_base + 1
             p_shape.type = Marker.CYLINDER
             p_shape.action = Marker.ADD
             p_shape.pose.position.x = sdata["x"]

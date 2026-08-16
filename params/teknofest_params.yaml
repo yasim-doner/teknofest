@@ -98,14 +98,6 @@ sign_detect:
     upper_enter_radius: 10
     stop_guard_seconds: 3.0
     diagnostic_every_frames: 5
-    min_stage_travel_distance: 1.5
-    min_stage_interval_seconds: 2.0
-    use_stage_geofence: true
-    stage_geofence_radius: 3.0
-    use_odom_fallback: true
-    odom_fallback_radius: 2.5
-    final_stage: 10
-    stop_after_final_stage: true
 
 ramp:
   ros__parameters:
@@ -128,6 +120,22 @@ target_detect:
     fx: 525.0
     fy: 525.0
     active_stage: 8
+    use_webcam: false
+    device_id: 0
+    show_window: false
+
+cmd_switch:
+  ros__parameters:
+    initial_stage: 0
+    min_stage_travel_distance: 1.5
+    min_stage_interval_seconds: 2.0
+    use_stage_geofence: true
+    stage_geofence_radius: 3.0
+    use_odom_fallback: true
+    odom_fallback_radius: 2.5
+    final_stage: 10
+
+
 
 
 
