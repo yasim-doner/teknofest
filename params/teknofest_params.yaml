@@ -2,8 +2,8 @@
 
 fallow_corridor:
   ros__parameters:
-    target_speed: 0.2
-    min_speed: 0.05
+    target_speed: 0.5
+    min_speed: 0.15
     max_angular_speed: 0.4
     kp_center: 0.8
     kp_avoid: 1.0
@@ -24,8 +24,8 @@ fallow_corridor:
 cone_avoid:
   ros__parameters:
     initial_stage: 5
-    target_speed: 0.18
-    slow_speed: 0.07
+    target_speed: 0.5
+    slow_speed: 0.15
     kp_lateral: 1.30
     kp_heading: 0.55
     max_angular_speed: 0.50
@@ -57,19 +57,16 @@ cone_avoid:
 dynamic_obstacle:
   ros__parameters:
     initial_stage: 0
-    target_speed: 0.45
+    target_speed: 0.5
     detection_min_x: 0.4
     detection_max_x: 2.2
-    detection_y: 0.8
-    vehicle_half_width: 0.38
+    detection_y: 0.45
     crop_min_z: -0.65
     crop_max_z: 0.65
     grid_cell_size: 0.2
     min_height_diff: 0.18
     min_points_threshold: 15
     crossing_duration: 3.0
-    kp_steering: 0.6
-    max_angular_speed: 0.3
 
 sign_detect:
   ros__parameters:
@@ -103,10 +100,15 @@ sign_detect:
 ramp:
   ros__parameters:
     active_stage: 8
-    drive_speed: 0.35
+    drive_speed: 0.5
     ramp_pitch_threshold_deg: 8.0
     flat_pitch_threshold_deg: 3.0
     flat_drive_duration: 1.0
+    ramp_up_drive_duration: 1.2
+    top_brake_speed: -0.18
+    top_brake_duration: 0.35
+    down_brake_speed: -0.28
+    down_brake_duration: 0.40
     stop_duration: 2.0
     laser_duration: 1.2
 
