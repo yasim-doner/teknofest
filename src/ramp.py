@@ -38,11 +38,13 @@ class RampNode(Node):
         self.declare_parameter("stop_duration", 2.0)
         self.declare_parameter("laser_duration", 1.2)
         self.declare_parameter("flat_drive_duration", 1.0)
+        self.declare_parameter("top_flat_drive_duration", 1.5)
+        self.declare_parameter("down_flat_drive_duration", 1.0)
         self.declare_parameter("ramp_up_drive_duration", 1.2)
         self.declare_parameter("top_brake_speed", -0.18)
         self.declare_parameter("top_brake_duration", 0.35)
-        self.declare_parameter("down_brake_speed", -0.28)
-        self.declare_parameter("down_brake_duration", 0.40)
+        self.declare_parameter("down_brake_speed", -0.80)
+        self.declare_parameter("down_brake_duration", 2.0)
 
         self.active_stages = [8, 9, 10]
         self.initial_stage = int(self.get_parameter("initial_stage").value)
@@ -58,6 +60,8 @@ class RampNode(Node):
         self.stop_duration = float(self.get_parameter("stop_duration").value)
         self.laser_duration = float(self.get_parameter("laser_duration").value)
         self.flat_drive_duration = float(self.get_parameter("flat_drive_duration").value)
+        self.top_flat_drive_duration = float(self.get_parameter("top_flat_drive_duration").value)
+        self.down_flat_drive_duration = float(self.get_parameter("down_flat_drive_duration").value)
         self.ramp_up_drive_duration = float(self.get_parameter("ramp_up_drive_duration").value)
         self.top_brake_speed = float(self.get_parameter("top_brake_speed").value)
         self.top_brake_duration = float(self.get_parameter("top_brake_duration").value)
@@ -276,10 +280,21 @@ class RampNode(Node):
 
             # Reached top flat area via IMU flat detection
             if self.flat_confirm_frames >= 4:
+                self.set_state("DRIVING_ON_TOP_FLAT")
+                self.get_logger().warning(
+                    f"Rampa tepe düzlüğü algılandı. Durmadan önce {self.top_flat_drive_duration}s sürüşe devam ediliyor."
+                )
+
+        elif self.state == "DRIVING_ON_TOP_FLAT":
+            # Continue driving forward on top flat platform for top_flat_drive_duration (1.5s) before stopping
+            self.publish_laser(False)
+            self.publish_velocity(linear_x=self.drive_speed)
+
+            if self.elapsed_in_state() >= self.top_flat_drive_duration:
                 self.publish_velocity(0.0, 0.0)
                 self.set_state("STOPPING_AT_TOP")
                 self.publish_release(8)  # Stage 8 (Tırmanma) bitti -> Stage 9 (Tepe/Lazer)
-                self.get_logger().warning("Rampa tepe düzlüğü algılandı (Stage 8 -> 9). Atış için duruluyor.")
+                self.get_logger().warning("Tepe düzlüğü sürüşü tamamlandı (Stage 8 -> 9). Atış için duruluyor.")
 
         elif self.state == "STOPPING_AT_TOP":
             # Reverse brake pulse for first top_brake_duration seconds to cancel forward momentum
@@ -314,12 +329,24 @@ class RampNode(Node):
 
             # Check if descent slope finished or timeout reached
             if self.descent_flat_frames >= 4 or self.elapsed_in_state() >= 4.0:
-                self.publish_velocity(0.0, 0.0)
+                self.set_state("DRIVING_OFF_RAMP_FLAT")
+                self.get_logger().warning(
+                    f"Rampadan iniş düzlüğü algılandı. Fren öncesi {self.down_flat_drive_duration}s sürüşe devam ediliyor."
+                )
+
+        elif self.state == "DRIVING_OFF_RAMP_FLAT":
+            # Continue driving forward on flat ground for down_flat_drive_duration (0.5s) before applying reverse brake
+            self.publish_laser(False)
+            self.publish_velocity(linear_x=self.drive_speed)
+
+            if self.elapsed_in_state() >= self.down_flat_drive_duration:
                 self.set_state("RAMP_DOWN_STOP")
-                self.get_logger().warning(f"Rampadan iniş tamamlandı. {self.stop_duration}s duruluyor.")
+                self.get_logger().warning(
+                    f"İniş sonrası düzlük sürüşü tamamlandı. {self.down_brake_duration}s boyunca ters hız uygulanacak."
+                )
 
         elif self.state == "RAMP_DOWN_STOP":
-            # Reverse brake pulse for first down_brake_duration seconds to cancel downhill momentum
+            # Reverse speed / braking pulse for down_brake_duration seconds (2.0s) to cancel downhill momentum
             elapsed = self.elapsed_in_state()
             self.publish_laser(False)
             if elapsed < self.down_brake_duration:
@@ -327,10 +354,10 @@ class RampNode(Node):
             else:
                 self.publish_velocity(0.0, 0.0)
 
-            if elapsed >= self.stop_duration:
+            if elapsed >= max(self.stop_duration, self.down_brake_duration):
                 self.set_state("DONE")
                 self.publish_release(10)  # Stage 10 (İniş/Son) bitti
-                self.get_logger().info("Rampa iniş duruşu tamamlandı. Stage 10 görevi bitti.")
+                self.get_logger().info("Rampa iniş ters frenlemesi ve duruşu tamamlandı. Stage 10 görevi bitti.")
 
         elif self.state == "DONE":
             self.publish_velocity(0.0, 0.0)

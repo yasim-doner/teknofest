@@ -58,6 +58,8 @@ dynamic_obstacle:
   ros__parameters:
     initial_stage: 0
     target_speed: 0.5
+    brake_speed: -0.15
+    brake_duration: 0.4
     detection_min_x: 0.4
     detection_max_x: 2.2
     detection_y: 0.45
@@ -104,11 +106,13 @@ ramp:
     ramp_pitch_threshold_deg: 8.0
     flat_pitch_threshold_deg: 3.0
     flat_drive_duration: 1.0
+    top_flat_drive_duration: 1.5
+    down_flat_drive_duration: 1.0
     ramp_up_drive_duration: 1.2
     top_brake_speed: -0.18
     top_brake_duration: 0.35
-    down_brake_speed: -0.28
-    down_brake_duration: 0.40
+    down_brake_speed: -1.0
+    down_brake_duration: 2.0
     stop_duration: 2.0
     laser_duration: 1.2
 
@@ -120,8 +124,8 @@ target_detect:
     # HD720 Mode  (1280x720) : fx = 350.0, fy = 350.0  (HFOV ~110°)
     # 2.2K Mode   (2208x1242): fx = 1050.0, fy = 1050.0
     # Gazebo Sim  (640x480)  : fx = 320.0, fy = 320.0  (HFOV = 90°)
-    fx: 525.0
-    fy: 525.0
+    fx: 320.0
+    fy: 320.0
     active_stage: 8
     use_webcam: false
     device_id: 0

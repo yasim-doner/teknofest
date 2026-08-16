@@ -24,6 +24,8 @@ class DynamicObstacleNode(Node):
         # Parameters
         self.declare_parameter("initial_stage", 0)
         self.declare_parameter("target_speed", 0.35)
+        self.declare_parameter("brake_speed", -0.15)
+        self.declare_parameter("brake_duration", 0.4)
         self.declare_parameter("detection_min_x", 0.4)
         self.declare_parameter("detection_max_x", 2.2)
         self.declare_parameter("detection_y", 0.45)
@@ -37,6 +39,7 @@ class DynamicObstacleNode(Node):
         initial_stage = int(self.get_parameter("initial_stage").value)
         self.is_active = initial_stage == 6
         self.clear_start_time = None
+        self.stop_start_time = None
 
         # Subscriptions & Publishers
         self.points_sub = self.create_subscription(
@@ -81,6 +84,8 @@ class DynamicObstacleNode(Node):
             return
 
         target_speed = float(self.get_parameter("target_speed").value)
+        brake_speed = float(self.get_parameter("brake_speed").value)
+        brake_duration = float(self.get_parameter("brake_duration").value)
         detection_min_x = float(self.get_parameter("detection_min_x").value)
         detection_max_x = float(self.get_parameter("detection_max_x").value)
         detection_y = float(self.get_parameter("detection_y").value)
@@ -113,6 +118,7 @@ class DynamicObstacleNode(Node):
                 self.stop_robot()
                 self.is_active = False
                 self.clear_start_time = None
+                self.stop_start_time = None
                 return
 
         # 2. Extract PointCloud2
@@ -163,14 +169,26 @@ class DynamicObstacleNode(Node):
 
         # 5. Barrier State Decision
         if obstacle_count >= min_points_threshold:
-            # Barrier CLOSED: Stop & Wait in front of corridor
-            self.stop_robot()
+            # Barrier CLOSED: Stop & Wait with brief reverse braking pulse
+            if self.stop_start_time is None:
+                self.stop_start_time = self.get_clock().now()
+
+            elapsed_stop = (self.get_clock().now() - self.stop_start_time).nanoseconds / 1e9
+            if elapsed_stop < brake_duration:
+                cmd_msg = Twist()
+                cmd_msg.linear.x = brake_speed
+                cmd_msg.angular.z = 0.0
+                self.cmd_vel_pub.publish(cmd_msg)
+            else:
+                self.stop_robot()
+
             self.get_logger().info(
-                f"[DUR-BEKLE] Bariyer kapalı (Ön koridorda {obstacle_count} engel noktası var).",
+                f"[DUR-BEKLE] Bariyer kapalı (Nokta: {obstacle_count}). Ters Fren: {brake_speed} m/s ({elapsed_stop:.2f}s)",
                 throttle_duration_sec=0.5,
             )
         else:
             # Barrier OPEN: Start crossing
+            self.stop_start_time = None
             self.clear_start_time = self.get_clock().now()
             cmd_msg = Twist()
             cmd_msg.linear.x = target_speed
