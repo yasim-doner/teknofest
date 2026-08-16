@@ -4,21 +4,21 @@ fallow_corridor:
   ros__parameters:
     target_speed: 0.5
     min_speed: 0.15
-    max_angular_speed: 0.4
-    kp_center: 0.8
-    kp_avoid: 1.0
+    max_angular_speed: 0.85
+    kp_center: 1.15
+    kp_avoid: 1.4
     pitch_scale_factor: 1.5
     min_speed_factor: 0.5
     max_speed_factor: 2.0
-    lookahead_min_x: 0.3
-    lookahead_max_x: 3.5
-    lookahead_y: 2.2
+    lookahead_min_x: 0.05
+    lookahead_max_x: 3.8
+    lookahead_y: 2.8
     crop_min_z: -0.65
     crop_max_z: 0.65
     grid_cell_size: 0.2
     min_height_diff: 0.18
-    front_obstacle_dist: 1.8
-    front_stop_dist: 0.65
+    front_obstacle_dist: 1.0
+    front_stop_dist: 0.55
     min_points_threshold: 15
 
 cone_avoid:
@@ -26,11 +26,11 @@ cone_avoid:
     initial_stage: 5
     target_speed: 0.5
     slow_speed: 0.15
-    kp_lateral: 1.30
-    kp_heading: 0.55
-    max_angular_speed: 0.50
-    hard_turn_speed: 0.50
-    smoothing_alpha: 0.45
+    kp_lateral: 1.45
+    kp_heading: 0.65
+    max_angular_speed: 0.85
+    hard_turn_speed: 0.60
+    smoothing_alpha: 0.35
     lookahead_min_x: 0.15
     lookahead_max_x: 3.00
     crop_half_width: 1.80

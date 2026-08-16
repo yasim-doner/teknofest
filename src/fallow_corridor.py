@@ -50,6 +50,8 @@ class FallowCorridorNode(Node):
         # Node State Variables
         self.current_pitch = 0.0
         self.has_imu = False
+        self.last_angular_z = 0.0
+        self.no_walls_count = 0
 
         # Subscriptions & Publishers
         self.points_sub = self.create_subscription(
@@ -130,8 +132,7 @@ class FallowCorridorNode(Node):
         else:
             self.get_logger().warn("Empty point cloud received.", throttle_duration_sec=2.0)
 
-        # 2. Local terrain segmentation (ignore slopes)
-        # Group cropped points into 2D grid cells in horizontal XY plane
+        # 2. Local terrain segmentation (ignore ground slopes)
         cells = {}
         for p in cropped_points:
             cx = int(p[0] // grid_cell_size)
@@ -141,7 +142,6 @@ class FallowCorridorNode(Node):
                 cells[cell_id] = []
             cells[cell_id].append(p)
 
-        # Keep only points that are significantly higher than the local ground floor (min Z) in their cell
         obstacle_pts = []
         for cell_id, cell_points in cells.items():
             min_z_val = min([pt[2] for pt in cell_points])
@@ -149,98 +149,92 @@ class FallowCorridorNode(Node):
                 if (pt[2] - min_z_val) >= min_height_diff:
                     obstacle_pts.append(pt)
 
-        left_pts = []
-        right_pts = []
-        front_pts = []
+        # 3. U-Corridor Dual-Slice (Near & Far) Path Estimation
+        # Split obstacle points into NEAR slice (0.05m - 1.5m) and FAR slice (1.5m - 3.8m)
+        near_pts = [p for p in obstacle_pts if 0.05 <= p[0] <= 1.5]
+        far_pts  = [p for p in obstacle_pts if 1.5 < p[0] <= lookahead_max_x]
 
-        # 3. Categorize the segmented vertical obstacle/wall points
-        for x, y, z in obstacle_pts:
-            # Left wall points (y > 0.25 to exclude front center)
-            if y >= 0.25:
-                left_pts.append((x, y, z))
-            # Right wall points (y < -0.25 to exclude front center)
-            elif y <= -0.25:
-                right_pts.append((x, y, z))
-            
-            # Front obstacle sector (directly in front, narrower width)
-            if abs(y) <= 0.45 and x <= front_obstacle_dist:
-                front_pts.append((x, y, z))
+        # --- NEAR SLICE (Local Centering) ---
+        near_left  = [p[1] for p in near_pts if p[1] >= 0.20]
+        near_right = [p[1] for p in near_pts if p[1] <= -0.20]
 
-        # Sort and average the closest points to find wall boundaries
-        # For left wall, smaller y means closer to robot
-        if len(left_pts) >= min_points_threshold:
-            left_pts.sort(key=lambda p: p[1])
-            left_y = np.mean([p[1] for p in left_pts[:max(1, len(left_pts) // 5)]])
-            has_left = True
+        has_near_left  = len(near_left) >= min_points_threshold
+        has_near_right = len(near_right) >= min_points_threshold
+
+        if has_near_left and has_near_right:
+            y_nl = np.mean(sorted(near_left)[:max(1, len(near_left) // 4)])
+            y_nr = np.mean(sorted(near_right, reverse=True)[:max(1, len(near_right) // 4)])
+            mid_y_near = (y_nl + y_nr) / 2.0
+            mode_near = "BOTH"
+        elif has_near_left:
+            y_nl = np.mean(sorted(near_left)[:max(1, len(near_left) // 4)])
+            mid_y_near = y_nl - 1.15
+            mode_near = "LEFT_ONLY"
+        elif has_near_right:
+            y_nr = np.mean(sorted(near_right, reverse=True)[:max(1, len(near_right) // 4)])
+            mid_y_near = y_nr + 1.15
+            mode_near = "RIGHT_ONLY"
         else:
-            left_y = 1.5  # default nominal value
-            has_left = False
+            mid_y_near = 0.0
+            mode_near = "NONE"
 
-        # For right wall, larger y (closest to 0) means closer to robot
-        if len(right_pts) >= min_points_threshold:
-            right_pts.sort(key=lambda p: p[1], reverse=True)
-            right_y = np.mean([p[1] for p in right_pts[:max(1, len(right_pts) // 5)]])
-            has_right = True
-        else:
-            right_y = -1.5  # default nominal value
-            has_right = False
+        # --- FAR SLICE (U-Turn / Ahead Corridor Curve Detection) ---
+        far_center = [p for p in far_pts if abs(p[1]) <= 0.50]
+        far_left   = [p[1] for p in far_pts if p[1] >= 0.20]
+        far_right  = [p[1] for p in far_pts if p[1] <= -0.20]
 
-        # Calculate steering commands using P-controller
-        angular_z = 0.0
-        control_mode = "NONE"
+        has_far_center = len(far_center) >= min_points_threshold
+        has_far_left   = len(far_left) >= min_points_threshold
+        has_far_right  = len(far_right) >= min_points_threshold
 
-        if has_left and has_right:
-            # Centering: target is midway between left and right walls
-            target_y = (left_y + right_y) / 2.0
-            angular_z = kp_center * target_y
-            control_mode = "CENTERING"
-        elif has_left:
-            # Single-wall following (left): gentler gain to avoid overcorrection
-            error = single_wall_target_dist - left_y
-            angular_z = -kp_center * 0.5 * error
-            control_mode = "FOLLOW_LEFT"
-        elif has_right:
-            # Single-wall following (right): gentler gain to avoid overcorrection
-            error = single_wall_target_dist - abs(right_y)
-            angular_z = kp_center * 0.5 * error
-            control_mode = "FOLLOW_RIGHT"
-        else:
-            control_mode = "NO_WALLS"
-
-        # Handle front obstacle and velocity scaling
-        linear_x = target_speed
-        
-        if front_pts:
-            # Find the closest point in front
-            closest_front_x = min([p[0] for p in front_pts])
-            
-            self.get_logger().info(f"Front obstacle detected at {closest_front_x:.2f}m", throttle_duration_sec=1.0)
-            
-            if closest_front_x <= front_stop_dist:
-                # Too close, emergency stop / hard turn away from obstacle centroid
-                linear_x = 0.0
-                mean_front_y = np.mean([p[1] for p in front_pts])
-                angular_z = -kp_avoid * mean_front_y
-                control_mode = "AVOID_STOP"
+        if has_far_center:
+            # U-turn curve or wall blocking straight path ahead!
+            # Determine open corridor direction
+            if len(far_left) > len(far_right) + 3:
+                # Outer U-bend wall is on the left -> U-turn goes RIGHT!
+                mid_y_far = -1.6
+                mode_far = "U_TURN_RIGHT"
+            elif len(far_right) > len(far_left) + 3:
+                # Outer U-bend wall is on the right -> U-turn goes LEFT!
+                mid_y_far = +1.6
+                mode_far = "U_TURN_LEFT"
             else:
-                # Decelerate proportionally as we get closer to the obstacle
-                scale = (closest_front_x - front_stop_dist) / (front_obstacle_dist - front_stop_dist)
-                linear_x = max(min_speed, target_speed * scale)
-                # Assist steering to avoid obstacle
-                mean_front_y = np.mean([p[1] for p in front_pts])
-                angular_z += -kp_avoid * mean_front_y * (1.0 - scale)
-                control_mode += "+AVOID"
+                # Symmetric wall directly ahead: steer towards open side with higher clearance
+                mean_fc_y = np.mean([p[1] for p in far_center])
+                mid_y_far = -1.5 if mean_fc_y >= 0.0 else +1.5
+                mode_far = "U_TURN_FORCE"
+        elif has_far_left and has_far_right:
+            y_fl = np.mean(sorted(far_left)[:max(1, len(far_left) // 4)])
+            y_fr = np.mean(sorted(far_right, reverse=True)[:max(1, len(far_right) // 4)])
+            mid_y_far = (y_fl + y_fr) / 2.0
+            mode_far = "BOTH"
+        elif has_far_left:
+            y_fl = np.mean(sorted(far_left)[:max(1, len(far_left) // 4)])
+            mid_y_far = y_fl - 1.15
+            mode_far = "LEFT_ONLY"
+        elif has_far_right:
+            y_fr = np.mean(sorted(far_right, reverse=True)[:max(1, len(far_right) // 4)])
+            mid_y_far = y_fr + 1.15
+            mode_far = "RIGHT_ONLY"
+        else:
+            mid_y_far = mid_y_near
+            mode_far = "NONE"
+
+        # Combine Near & Far Slice Steering Offset
+        target_y = 0.35 * mid_y_near + 0.65 * mid_y_far
+        angular_z = kp_center * target_y
+
+        # Keep cruising speed CONSTANT at target_speed (0.5 m/s) - Never slow down or stop!
+        linear_x = target_speed
 
         # 4. Incline Speed Compensation
-        # Negative pitch means nose is tilted up (positive slope -> increase power)
-        # Positive pitch means nose is tilted down (negative slope -> decrease power)
         speed_factor = 1.0
         if self.has_imu and linear_x > 0.0:
             speed_factor = 1.0 - (self.current_pitch * pitch_scale_factor)
             speed_factor = np.clip(speed_factor, min_speed_factor, max_speed_factor)
             linear_x = linear_x * speed_factor
 
-        # Clamp angular velocity to prevent violent open-loop spinning
+        # Clamp angular velocity limit
         angular_z = np.clip(angular_z, -max_angular_speed, max_angular_speed)
 
         # Publish velocities
@@ -250,12 +244,10 @@ class FallowCorridorNode(Node):
         self.cmd_vel_pub.publish(cmd_msg)
 
         # Log status
-        left_str = f"{left_y:.2f}m" if has_left else "N/A"
-        right_str = f"{right_y:.2f}m" if has_right else "N/A"
         self.get_logger().info(
-            f"[{control_mode}] L_wall: {left_str} | R_wall: {right_str} | "
-            f"Pitch: {self.current_pitch:.3f} rad | "
-            f"Cmd Power: v={linear_x:.3f} (factor={speed_factor:.2f}), w={angular_z:.3f}",
+            f"[U-CORRIDOR] Near:{mode_near} Far:{mode_far} | "
+            f"mid_near={mid_y_near:.2f}m mid_far={mid_y_far:.2f}m target_y={target_y:.2f}m | "
+            f"Cmd: v={linear_x:.2f} m/s, w={angular_z:.2f} rad/s",
             throttle_duration_sec=0.5
         )
 
