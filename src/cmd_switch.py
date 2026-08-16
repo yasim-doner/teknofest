@@ -92,6 +92,8 @@ class CmdSwitchNode(Node):
             5: "/cone_avoid/cmd_vel",
             6: "/dynamic_obstacle/cmd_vel",
             8: "/ramp/cmd_vel",
+            9: "/ramp/cmd_vel",
+            10: "/ramp/cmd_vel",
         }
 
         # Publishers
@@ -375,7 +377,7 @@ class CmdSwitchNode(Node):
             self.cmd_vel_pub.publish(msg)
 
     def ramp_callback(self, msg: Twist):
-        if self.active_stage == 8:
+        if self.active_stage in (8, 9, 10):
             self.cmd_vel_pub.publish(msg)
 
     def release_callback(self, msg: Int32):

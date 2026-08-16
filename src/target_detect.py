@@ -69,6 +69,7 @@ class TargetDetector(Node):
         # State & Data Variables
         self.current_stage = 0
         self.laser_active = False
+        self.result_saved = False
 
         # ROI & Motion Tracking State
         self.tracking = False
@@ -144,7 +145,38 @@ class TargetDetector(Node):
         self.current_stage = int(msg.data)
 
     def laser_on_callback(self, msg):
-        self.laser_active = bool(msg.data)
+        new_state = bool(msg.data)
+        if new_state and not self.laser_active:
+            self.result_saved = False
+        self.laser_active = new_state
+
+    def save_target_result(self, debug_img, yaw_deg, pitch_deg, du, dv, score):
+        try:
+            import json, os
+            out_dir = "/home/myazou/rover_ws/src/teknofest"
+            img_path = os.path.join(out_dir, "target_result.jpg")
+            json_path = os.path.join(out_dir, "target_result.json")
+
+            cv2.imwrite(img_path, debug_img)
+
+            res_data = {
+                "timestamp": float(self.get_clock().now().nanoseconds / 1e9),
+                "yaw_deg": float(yaw_deg),
+                "pitch_deg": float(pitch_deg),
+                "du_px": float(du),
+                "dv_px": float(dv),
+                "score": float(score),
+                "image_saved": img_path,
+            }
+            with open(json_path, "w") as f:
+                json.dump(res_data, f, indent=2)
+
+            self.get_logger().warning(
+                f"[HEDEF TESPİT EDİLDİ & KAYDEDİLDİ] Yaw: {yaw_deg:.2f}°, Pitch: {pitch_deg:.2f}°. "
+                f"Görsel '{img_path}', veriler '{json_path}' dosyasına kaydedildi."
+            )
+        except Exception as e:
+            self.get_logger().error(f"Hedef sonucu kaydetme hatası: {e}")
 
     def detect_target_in_image(self, frame, is_roi=False):
         """
@@ -162,7 +194,7 @@ class TargetDetector(Node):
         contours, hierarchy = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         if hierarchy is None or len(contours) == 0:
-            return False, 0, 0, 0, None
+            return False, 0, 0, 0, None, 0.0
 
         candidates = []
 
@@ -446,6 +478,11 @@ class TargetDetector(Node):
                 (255, 255, 255),
                 1,
             )
+
+            # Tepedeyken / Lazer aktifken sonucu otomatik kaydet
+            if (self.laser_active or self.current_stage == 8) and not self.result_saved:
+                self.save_target_result(debug_img, yaw_deg, pitch_deg, du, dv, target_score)
+                self.result_saved = True
 
         else:
             cv2.putText(

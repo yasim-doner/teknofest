@@ -38,8 +38,13 @@ class RampNode(Node):
         self.declare_parameter("stop_duration", 2.0)
         self.declare_parameter("laser_duration", 1.2)
         self.declare_parameter("flat_drive_duration", 1.0)
+        self.declare_parameter("ramp_up_drive_duration", 1.2)
+        self.declare_parameter("top_brake_speed", -0.18)
+        self.declare_parameter("top_brake_duration", 0.35)
+        self.declare_parameter("down_brake_speed", -0.28)
+        self.declare_parameter("down_brake_duration", 0.40)
 
-        self.active_stage = int(self.get_parameter("active_stage").value)
+        self.active_stages = [8, 9, 10]
         self.initial_stage = int(self.get_parameter("initial_stage").value)
         self.drive_speed = float(self.get_parameter("drive_speed").value)
 
@@ -53,6 +58,11 @@ class RampNode(Node):
         self.stop_duration = float(self.get_parameter("stop_duration").value)
         self.laser_duration = float(self.get_parameter("laser_duration").value)
         self.flat_drive_duration = float(self.get_parameter("flat_drive_duration").value)
+        self.ramp_up_drive_duration = float(self.get_parameter("ramp_up_drive_duration").value)
+        self.top_brake_speed = float(self.get_parameter("top_brake_speed").value)
+        self.top_brake_duration = float(self.get_parameter("top_brake_duration").value)
+        self.down_brake_speed = float(self.get_parameter("down_brake_speed").value)
+        self.down_brake_duration = float(self.get_parameter("down_brake_duration").value)
 
         self.current_stage = self.initial_stage
         self.pitch = 0.0
@@ -65,7 +75,7 @@ class RampNode(Node):
 
         self.state = (
             "APPROACH_RAMP"
-            if self.current_stage == self.active_stage
+            if self.current_stage in self.active_stages
             else "WAIT_STAGE"
         )
         self.state_start_time = self.now_seconds()
@@ -111,7 +121,7 @@ class RampNode(Node):
         )
 
         self.get_logger().info(
-            f"=== Stage 8 Ramp Node başladı (Hız={self.drive_speed} m/s, Durma={self.stop_duration}s) ==="
+            f"=== Stage 8-9-10 Ramp Node başladı (Hız={self.drive_speed} m/s, Durma={self.stop_duration}s) ==="
         )
 
     def now_seconds(self):
@@ -151,6 +161,12 @@ class RampNode(Node):
         msg.data = bool(is_on)
         self.laser_pub.publish(msg)
 
+    def publish_release(self, stage_num):
+        msg = Int32()
+        msg.data = int(stage_num)
+        self.release_pub.publish(msg)
+        self.get_logger().info(f"Stage {stage_num} serbest bırakıldı (/teknofest/release={stage_num}).")
+
     def reset_task(self):
         self.ramp_up_confirm_frames = 0
         self.flat_confirm_frames = 0
@@ -167,16 +183,16 @@ class RampNode(Node):
         self.current_stage = incoming_stage
 
         if (
-            self.current_stage == self.active_stage
-            and previous_stage != self.active_stage
+            self.current_stage in self.active_stages
+            and previous_stage not in self.active_stages
         ):
             self.reset_task()
             self.set_state("APPROACH_RAMP")
-            self.get_logger().info("Stage 8 aktif: Rampa yaklaşımı başladı.")
+            self.get_logger().info(f"Stage {self.current_stage} aktif: Rampa dizisi başlatıldı.")
 
         elif (
-            self.current_stage != self.active_stage
-            and previous_stage == self.active_stage
+            self.current_stage not in self.active_stages
+            and previous_stage in self.active_stages
         ):
             self.reset_task()
 
@@ -214,7 +230,7 @@ class RampNode(Node):
                 self.descent_flat_frames = 0
 
     def control_loop(self):
-        if self.current_stage != self.active_stage:
+        if self.current_stage not in self.active_stages:
             self.publish_velocity(0.0, 0.0)
             self.publish_laser(False)
             return
@@ -226,20 +242,32 @@ class RampNode(Node):
 
             # Ramp climb detected (pitch >= threshold)
             if self.ramp_up_confirm_frames >= 2 or abs(self.pitch) >= self.ramp_pitch_threshold:
+                self.set_state("DRIVING_UP_RAMP_MID")
+                self.get_logger().warning(
+                    f"Rampa çıkış eğimi algılandı (Pitch={math.degrees(self.pitch):.1f}°). "
+                    f"Rampa ortasına tırmanılıyor ({self.ramp_up_drive_duration}s sürüş)..."
+                )
+
+        elif self.state == "DRIVING_UP_RAMP_MID":
+            # Driving up the slope towards the middle of the ramp incline
+            self.publish_laser(False)
+            self.publish_velocity(linear_x=self.drive_speed)
+
+            if self.elapsed_in_state() >= self.ramp_up_drive_duration:
                 self.publish_velocity(0.0, 0.0)
                 self.set_state("RAMP_UP_STOP")
                 self.get_logger().warning(
-                    f"Rampa çıkışı algılandı (Pitch={math.degrees(self.pitch):.1f}°). {self.stop_duration}s duruluyor."
+                    f"Rampa ortasına ulaşıldı. {self.stop_duration}s duruluyor."
                 )
 
         elif self.state == "RAMP_UP_STOP":
-            # 2 second stop at ramp start (climbing)
+            # Stop at ramp middle
             self.publish_velocity(0.0, 0.0)
             self.publish_laser(False)
 
             if self.elapsed_in_state() >= self.stop_duration:
                 self.set_state("CLIMBING_RAMP")
-                self.get_logger().info("Rampa çıkış duruşu tamamlandı. Tırmanış başladı.")
+                self.get_logger().info("Rampa orta duruşu tamamlandı. Zirveye tırmanış devam ediyor.")
 
         elif self.state == "CLIMBING_RAMP":
             # Climbing ramp towards the top flat area
@@ -250,14 +278,19 @@ class RampNode(Node):
             if self.flat_confirm_frames >= 4:
                 self.publish_velocity(0.0, 0.0)
                 self.set_state("STOPPING_AT_TOP")
-                self.get_logger().warning("Rampa tepe düzlüğü algılandı. Atış için duruluyor.")
+                self.publish_release(8)  # Stage 8 (Tırmanma) bitti -> Stage 9 (Tepe/Lazer)
+                self.get_logger().warning("Rampa tepe düzlüğü algılandı (Stage 8 -> 9). Atış için duruluyor.")
 
         elif self.state == "STOPPING_AT_TOP":
-            # 2 second stop at top for laser task
-            self.publish_velocity(0.0, 0.0)
+            # Reverse brake pulse for first top_brake_duration seconds to cancel forward momentum
+            elapsed = self.elapsed_in_state()
             self.publish_laser(False)
+            if elapsed < self.top_brake_duration:
+                self.publish_velocity(linear_x=self.top_brake_speed)
+            else:
+                self.publish_velocity(0.0, 0.0)
 
-            if self.elapsed_in_state() >= self.stop_duration:
+            if elapsed >= self.stop_duration:
                 self.set_state("LASER_ON")
                 self.get_logger().warning("Atış duruş süresi doldu. Lazer açılıyor.")
 
@@ -271,7 +304,8 @@ class RampNode(Node):
                 self.descent_pitch_seen = False
                 self.descent_flat_frames = 0
                 self.set_state("DESCENDING_RAMP")
-                self.get_logger().info("Lazer görevi tamamlandı. Rampadan iniliyor.")
+                self.publish_release(9)  # Stage 9 (Lazer) bitti -> Stage 10 (İniş)
+                self.get_logger().info("Lazer görevi tamamlandı (Stage 9 -> 10). Rampadan iniliyor.")
 
         elif self.state == "DESCENDING_RAMP":
             # Driving forward down the ramp
@@ -285,21 +319,22 @@ class RampNode(Node):
                 self.get_logger().warning(f"Rampadan iniş tamamlandı. {self.stop_duration}s duruluyor.")
 
         elif self.state == "RAMP_DOWN_STOP":
-            # 2 second stop after descending ramp
-            self.publish_velocity(0.0, 0.0)
+            # Reverse brake pulse for first down_brake_duration seconds to cancel downhill momentum
+            elapsed = self.elapsed_in_state()
             self.publish_laser(False)
+            if elapsed < self.down_brake_duration:
+                self.publish_velocity(linear_x=self.down_brake_speed)
+            else:
+                self.publish_velocity(0.0, 0.0)
 
-            if self.elapsed_in_state() >= self.stop_duration:
+            if elapsed >= self.stop_duration:
                 self.set_state("DONE")
-                self.get_logger().info("Rampa iniş duruşu tamamlandı. Stage 8 görevi bitti.")
+                self.publish_release(10)  # Stage 10 (İniş/Son) bitti
+                self.get_logger().info("Rampa iniş duruşu tamamlandı. Stage 10 görevi bitti.")
 
         elif self.state == "DONE":
             self.publish_velocity(0.0, 0.0)
             self.publish_laser(False)
-
-            release_msg = Int32()
-            release_msg.data = self.active_stage
-            self.release_pub.publish(release_msg)
 
 
 def main(args=None):
