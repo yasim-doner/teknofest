@@ -16,9 +16,11 @@ from rclpy.qos import (
     HistoryPolicy,
     QoSProfile,
     ReliabilityPolicy,
+    qos_profile_sensor_data,
 )
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Bool, Float32, Int32, String
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -64,6 +66,10 @@ class SignDetector(Node):
             "image_topic",
             "/rover/camera/image_raw",
         )
+        self.declare_parameter(
+            "pointcloud_topic",
+            "/rover/points",
+        )
         self.declare_parameter("initial_stage", 0)
 
         self.declare_parameter("min_component_area", 30)
@@ -104,6 +110,10 @@ class SignDetector(Node):
         self.image_topic = str(
             self.get_parameter("image_topic").value
         )
+        self.pointcloud_topic = str(
+            self.get_parameter("pointcloud_topic").value
+        )
+        self.latest_cloud_points = None
         self.initial_stage = max(
             0,
             min(
@@ -289,6 +299,13 @@ class SignDetector(Node):
             self.image_topic,
             self.image_callback,
             self.camera_qos,
+        )
+
+        self.pointcloud_sub = self.create_subscription(
+            PointCloud2,
+            self.pointcloud_topic,
+            self.pointcloud_callback,
+            qos_profile_sensor_data,
         )
 
         self.odom_sub = self.create_subscription(
@@ -739,19 +756,67 @@ class SignDetector(Node):
         self.odom_y = float(msg.pose.pose.position.y)
         self.odom_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
 
+    def pointcloud_callback(self, msg: PointCloud2):
+        try:
+            pts = list(
+                pc2.read_points(
+                    msg, field_names=("x", "y", "z"), skip_nans=True
+                )
+            )
+            if pts:
+                arr = np.asarray(pts)
+                if arr.dtype.names is not None:
+                    self.latest_cloud_points = np.column_stack((arr["x"], arr["y"], arr["z"])).astype(np.float32)
+                else:
+                    self.latest_cloud_points = np.array([(p[0], p[1], p[2]) for p in pts], dtype=np.float32)
+        except Exception as exc:
+            self.get_logger().error(
+                f"PointCloud okuma hatası: {exc}",
+                throttle_duration_sec=5.0,
+            )
+
     def estimate_candidate_position(self, candidate):
         if candidate is None:
-            return None, None, None
+            return None, None, None, "None"
 
         cx = candidate["cx"]
         cy = candidate["cy"]
         radius = candidate["radius"]
 
         if radius <= 0:
-            return None, None, None
+            return None, None, None, "None"
 
         focal_length = 554.0
         depth = (focal_length * self.real_sign_radius) / max(1.0, float(radius))
+        depth_source = "Camera Pinhole"
+
+        # LiDAR PointCloud Fusion
+        if self.latest_cloud_points is not None and len(self.latest_cloud_points) > 0:
+            theta_cam = math.atan2(-(cx - 320.0), focal_length)
+            phi_cam = math.atan2(-(cy - 240.0), focal_length)
+
+            pts = self.latest_cloud_points
+            front_mask = pts[:, 0] > 0.3
+            pts_front = pts[front_mask]
+
+            if len(pts_front) > 0:
+                theta_pts = np.arctan2(pts_front[:, 1], pts_front[:, 0])
+                phi_pts = np.arctan2(pts_front[:, 2] - 0.40, pts_front[:, 0])
+
+                d_theta = np.abs(theta_pts - theta_cam)
+                d_phi = np.abs(phi_pts - phi_cam)
+
+                sector_mask = (d_theta <= np.radians(3.5)) & (d_phi <= np.radians(5.0))
+                matching_pts = pts_front[sector_mask]
+
+                if len(matching_pts) >= 3:
+                    x_dists = np.sort(matching_pts[:, 0])
+                    n_p = len(x_dists)
+                    lidar_depth = float(np.median(x_dists[: max(3, int(n_p * 0.5))]))
+                    if 0.3 <= lidar_depth <= 15.0:
+                        depth = lidar_depth
+                        depth_source = "LiDAR"
+
         x_cam = ((cx - 320.0) * depth) / focal_length
         y_cam = ((cy - 240.0) * depth) / focal_length
 
@@ -764,9 +829,9 @@ class SignDetector(Node):
             x_world = self.odom_x + x_rel * math.cos(yaw) - y_rel * math.sin(yaw)
             y_world = self.odom_y + x_rel * math.sin(yaw) + y_rel * math.cos(yaw)
             z_world = z_rel
-            return x_world, y_world, z_world
+            return x_world, y_world, z_world, depth_source
 
-        return None, None, None
+        return None, None, None, depth_source
 
     def process_sign_candidates(self, candidates):
         if not candidates:
@@ -787,7 +852,7 @@ class SignDetector(Node):
             match_score = candidate.get("match_score", 0.0)
             tmpl_meta = candidate.get("tmpl_meta", None)
 
-            x_world, y_world, _ = self.estimate_candidate_position(candidate)
+            x_world, y_world, _, depth_src = self.estimate_candidate_position(candidate)
 
             if not (matched_key and match_score >= self.template_match_threshold):
                 continue
@@ -828,9 +893,10 @@ class SignDetector(Node):
                             "is_stop": is_stop,
                         }
                         tag_desc = f"Stage {stage_num}" if stage_num is not None else "STOP Tabelası"
+                        calc_dist = math.hypot(x_world - self.odom_x, y_world - self.odom_y)
                         self.get_logger().info(
-                            f"[TABELA KONUMU KAYDEDİLDİ] {tag_desc} ({matched_key}) harita konumu kaydedildi: "
-                            f"({x_world:.2f}, {y_world:.2f})."
+                            f"[TABELA KONUMU KAYDEDİLDİ] {tag_desc} ({matched_key}) harita konumu: "
+                            f"({x_world:.2f}, {y_world:.2f}) [Mesafe Kaynağı: {depth_src}, Derinlik: {calc_dist:.2f}m]."
                         )
                         self.publish_sign_marker(candidate)
                     else:
