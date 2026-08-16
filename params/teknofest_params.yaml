@@ -74,6 +74,7 @@ dynamic_obstacle:
 sign_detect:
   ros__parameters:
     image_topic: "/rover/camera/image_raw"
+    pointcloud_topic: "/rover/points"
     textures_dir: "/home/myazou/rover_ws/src/teknofest/textures"
     use_template_matching: true
     template_match_threshold: 0.65

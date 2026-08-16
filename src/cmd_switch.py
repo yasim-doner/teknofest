@@ -346,6 +346,7 @@ class CmdSwitchNode(Node):
                 if stage_num is not None
                 else ("STOP" if is_stop else sign_key)
             )
+            is_new = key not in self.detected_signs
             self.detected_signs[key] = {
                 "x": x_world,
                 "y": y_world,
@@ -353,19 +354,13 @@ class CmdSwitchNode(Node):
                 "is_stop": is_stop,
             }
 
-            if stage_num is not None:
-                stage_int = int(stage_num)
-                if stage_int == self.active_stage + 1:
-                    allowed = self.stage_change_allowed(stage_int)
-                    if allowed:
-                        old_stage = self.active_stage
-                        self.active_stage = min(self.final_stage, stage_int)
-                        self.released_stage = None
-                        self.record_stage_change()
-                        self.get_logger().info(
-                            f"[TABELA ALGILANDI - STAGE GEÇİŞİ] Stage {old_stage} -> {self.active_stage} ({label})"
-                        )
-                        self.publish_stage()
+            if is_new:
+                tag_desc = f"Stage {stage_num}" if stage_num is not None else f"{key}"
+                self.get_logger().info(
+                    f"[TABELA KONUMU KAYDEDİLDİ] {tag_desc} ({label}) algılandı ve konumu "
+                    f"({x_world:.2f}, {y_world:.2f}) olarak haritaya işlendi. "
+                    "Araç tabelanın yanına ulaşınca Stage geçişi yapılacak."
+                )
 
     def fallow_callback(self, msg: Twist):
         if self.active_stage not in self.stage_topics:
