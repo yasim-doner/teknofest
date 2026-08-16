@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import sys
 import math
 import cv2
 import numpy as np
@@ -37,9 +38,11 @@ class TargetDetector(Node):
     """
     Kamera görüntüsü işleme ile hedef (hedef tahtası / nişan noktası) tespiti ve
     turret / lazer atış açılarını (/laser_angle) kamera piksel sapmaları üzerinden hesaplayan ROS 2 Düğümü.
+    Hem ROS 2 kamera topic'leri hem de bilgisayarın dahili/harici web kamerası ile çalışabilir.
+    Bölgesel Arama (ROI Tracking) ve Hız Tahmini (Motion Prediction) ile hareketli hedeflerde yüksek başarım sağlar.
     """
 
-    def __init__(self):
+    def __init__(self, use_webcam_cli=False, device_id_cli=0, show_window_cli=False):
         super().__init__("target_detect")
 
         # Parametreler
@@ -47,17 +50,34 @@ class TargetDetector(Node):
         self.declare_parameter("fx", 525.0)
         self.declare_parameter("fy", 525.0)
         self.declare_parameter("active_stage", 8)
+        self.declare_parameter("use_webcam", use_webcam_cli)
+        self.declare_parameter("device_id", device_id_cli)
+        self.declare_parameter("show_window", show_window_cli or use_webcam_cli)
 
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.fx = float(self.get_parameter("fx").value)
         self.fy = float(self.get_parameter("fy").value)
         self.active_stage = int(self.get_parameter("active_stage").value)
+        self.use_webcam = bool(self.get_parameter("use_webcam").value)
+        self.device_id = int(self.get_parameter("device_id").value)
+        self.show_window = bool(self.get_parameter("show_window").value)
 
         self.bridge = CvBridge()
+        self.cap = None
+        self.timer = None
 
         # State & Data Variables
         self.current_stage = 0
         self.laser_active = False
+
+        # ROI & Motion Tracking State
+        self.tracking = False
+        self.last_target_center = None  # (u, v)
+        self.last_target_radius = None  # float
+        self.velocity = [0.0, 0.0]      # [vx, vy] in px/frame
+        self.tracking_confidence = 0
+        self.roi_missed_count = 0
+        self.max_roi_missed_frames = 3
 
         # QoS Ayarları
         self.camera_qos = QoSProfile(
@@ -85,12 +105,6 @@ class TargetDetector(Node):
         )
 
         # Subscriptions
-        self.image_sub = self.create_subscription(
-            Image,
-            self.image_topic,
-            self.image_callback,
-            self.camera_qos,
-        )
         self.stage_sub = self.create_subscription(
             Int32,
             "/teknofest/stage_id",
@@ -104,8 +118,26 @@ class TargetDetector(Node):
             10,
         )
 
+        if self.use_webcam:
+            self.get_logger().info(f"Kamera Modu: Bilgisayar Kamerası (Device Index={self.device_id})")
+            self.cap = cv2.VideoCapture(self.device_id)
+            if not self.cap.isOpened():
+                self.get_logger().error(f"HATA: Cihaz indeks {self.device_id} olan bilgisayar kamerası açılamadı!")
+            else:
+                self.get_logger().info("Bilgisayar kamerası başarıyla açıldı. Görüntü işleme başlatılıyor...")
+                # 30 FPS timer
+                self.timer = self.create_timer(1.0 / 30.0, self.webcam_timer_callback)
+        else:
+            self.get_logger().info(f"Kamera Modu: ROS Topic ({self.image_topic})")
+            self.image_sub = self.create_subscription(
+                Image,
+                self.image_topic,
+                self.image_callback,
+                self.camera_qos,
+            )
+
         self.get_logger().info(
-            f"=== Target Detect Node Başlatıldı (Topic={self.image_topic}, fx={self.fx}, fy={self.fy}) ==="
+            f"=== Target Detect Node Başlatıldı (fx={self.fx}, fy={self.fy}, show_window={self.show_window}) ==="
         )
 
     def stage_callback(self, msg):
@@ -114,9 +146,9 @@ class TargetDetector(Node):
     def laser_on_callback(self, msg):
         self.laser_active = bool(msg.data)
 
-    def detect_target_in_image(self, frame):
+    def detect_target_in_image(self, frame, is_roi=False):
         """
-        Siyah-beyaz hedef tahtasını uzaktan (küçük boyutlarda) ortak merkezli (konsantrik)
+        Siyah-beyaz hedef tahtasını uzaktan/yakından ortak merkezli (konsantrik)
         çemberler arayarak tespit eder. Gürültülere ve renk değişimlerine karşı dayanıklıdır.
         Dönen değer: (target_found, u_center, v_center, radius, contour)
         """
@@ -134,13 +166,16 @@ class TargetDetector(Node):
 
         candidates = []
 
+        max_area_ratio = 0.85 if is_roi else 0.25
+        max_radius = min(w, h) * 0.45 if is_roi else 150.0
+
         for i, cnt in enumerate(contours):
             area = cv2.contourArea(cnt)
-            if area < 10 or area > (w * h * 0.2):
+            if area < 10 or area > (w * h * max_area_ratio):
                 continue
 
             (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-            if radius < 3 or radius > 120:
+            if radius < 3 or radius > max_radius:
                 continue
 
             # Dairesellik kontrolü (4 * pi * area / perimeter^2)
@@ -153,41 +188,102 @@ class TargetDetector(Node):
             x, y, bw, bh = cv2.boundingRect(cnt)
             aspect = float(bw) / float(bh) if bh > 0 else 0.0
 
-            if circularity > 0.4 and 0.55 <= aspect <= 1.45:
+            if circularity > 0.50 and 0.60 <= aspect <= 1.40:
                 candidates.append({
                     'idx': i,
                     'center': (cx, cy),
                     'radius': radius,
                     'area': area,
-                    'cnt': cnt
+                    'cnt': cnt,
+                    'circ': circularity
                 })
 
-        # Yakın merkezli (ortak merkezli / konsantrik) çember gruplarını bul
-        groups = []
+        # Yakın merkezli (ortak merkezli / konsantrik) çember gruplarını bul ve 1:2:3 oran filtrelemesi uygula
+        evaluated_groups = []
+        
         for i, c1 in enumerate(candidates):
-            group = [c1]
+            raw_group = [c1]
             for j, c2 in enumerate(candidates):
                 if i == j:
                     continue
                 dist = np.hypot(c1['center'][0] - c2['center'][0], c1['center'][1] - c2['center'][1])
-                if dist < max(4.0, c1['radius'] * 0.25):
-                    group.append(c2)
+                if dist < max(4.0, c1['radius'] * 0.30):
+                    raw_group.append(c2)
 
-            if len(group) >= 2:  # En az 2 konsantrik hiyerarşik çember
-                groups.append(group)
+            if len(raw_group) < 2:
+                continue
 
-        groups.sort(key=lambda g: len(g), reverse=True)
+            # Benzer yarıçapa sahip çemberleri (iç/dış kenar çiftleri) ayıkla/birleştir
+            raw_group.sort(key=lambda c: c['radius'])
+            unique_rings = []
+            for c in raw_group:
+                if not unique_rings:
+                    unique_rings.append(c)
+                else:
+                    prev_r = unique_rings[-1]['radius']
+                    # Yarıçap farkı en az %15 olmalı ki farklı bir halka sayılsın
+                    if (c['radius'] - prev_r) / prev_r > 0.15:
+                        unique_rings.append(c)
 
-        if len(groups) > 0:
-            best_group = groups[0]
+            k = len(unique_rings)
+            if k < 2:
+                continue
+
+            # Hedef halkaları yarıçap oranları: 3 cm, 6 cm, 9 cm (Oranlar: 1 : 2 : 3)
+            radii = [c['radius'] for c in unique_rings]
+            avg_circ = float(np.mean([c['circ'] for c in unique_rings]))
+            score = -1.0
+            best_sub_cnts = unique_rings
+
+            if k >= 3:
+                # 3 halka tespiti: r1/r3 ~ 1/3 (0.333) ve r2/r3 ~ 2/3 (0.667)
+                r1, r2, r3 = radii[0], radii[1], radii[-1]
+                ratio1 = r1 / r3
+                ratio2 = r2 / r3
+                err = abs(ratio1 - (3.0 / 9.0)) + abs(ratio2 - (6.0 / 9.0))
+
+                # Perspektif ve açı sapması toleransı (maks %25 sapma)
+                if err < 0.25:
+                    score = (100.0 - (err * 100.0)) * avg_circ
+            elif k == 2:
+                # 2 halka esneklik takibi (r1/r2 için beklenen oranlar: 3/9=0.333, 6/9=0.667, 3/6=0.500)
+                r1, r2 = radii[0], radii[1]
+                ratio = r1 / r2
+                target_ratios = [3.0 / 9.0, 6.0 / 9.0, 3.0 / 6.0]
+                min_err = min(abs(ratio - tr) for tr in target_ratios)
+
+                if min_err < 0.18:
+                    score = (50.0 - (min_err * 100.0)) * avg_circ
+
+            if score >= 35.0:
+                evaluated_groups.append({
+                    'score': score,
+                    'rings': best_sub_cnts,
+                    'num_rings': k
+                })
+
+        # En yüksek oran uyum skoruna sahip grubu seç
+        evaluated_groups.sort(key=lambda g: g['score'], reverse=True)
+
+        if len(evaluated_groups) > 0:
+            best_group = evaluated_groups[0]['rings']
+            best_score = evaluated_groups[0]['score']
             avg_cx = int(round(np.mean([c['center'][0] for c in best_group])))
             avg_cy = int(round(np.mean([c['center'][1] for c in best_group])))
             max_r = int(round(np.max([c['radius'] for c in best_group])))
             best_cnt = best_group[0]['cnt']
 
-            return True, avg_cx, avg_cy, max_r, best_cnt
+            return True, avg_cx, avg_cy, max_r, best_cnt, best_score
 
-        return False, 0, 0, 0, None
+        return False, 0, 0, 0, None, 0.0
+
+    def webcam_timer_callback(self):
+        if self.cap is not None and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                self.get_logger().warning("Bilgisayar kamerasından kare okunamadı!")
+                return
+            self.process_frame(frame)
 
     def image_callback(self, msg):
         try:
@@ -196,11 +292,87 @@ class TargetDetector(Node):
             self.get_logger().error(f"Görüntü dönüştürme hatası: {e}")
             return
 
-        h, w = frame.shape[:2]
-        found, u, v, radius, cnt = self.detect_target_in_image(frame)
+        self.process_frame(frame)
 
+    def process_frame(self, frame):
+        h, w = frame.shape[:2]
         debug_img = frame.copy()
         center_u, center_v = w // 2, h // 2
+
+        found = False
+        u, v, radius = 0, 0, 0
+        target_score = 0.0
+        roi_box = None  # (x1, y1, x2, y2)
+        search_mode = "GLOBAL"
+
+        # 1. ROI (Bölgesel Arama) ile Takip Modu
+        if self.tracking and self.last_target_center is not None:
+            last_u, last_v = self.last_target_center
+            last_r = self.last_target_radius or 30.0
+
+            # Tahmini yeni merkez (Hız kompanzasyonu ile)
+            pred_u = last_u + self.velocity[0]
+            pred_v = last_v + self.velocity[1]
+
+            margin_x = max(int(last_r * 3.5), 90)
+            margin_y = max(int(last_r * 3.5), 90)
+
+            x1 = max(0, int(pred_u - margin_x))
+            y1 = max(0, int(pred_v - margin_y))
+            x2 = min(w, int(pred_u + margin_x))
+            y2 = min(h, int(pred_v + margin_y))
+
+            roi_box = (x1, y1, x2, y2)
+
+            if (x2 - x1) > 20 and (y2 - y1) > 20:
+                roi_frame = frame[y1:y2, x1:x2]
+                found_roi, local_u, local_v, r_roi, _, score_roi = self.detect_target_in_image(roi_frame, is_roi=True)
+
+                if found_roi:
+                    found = True
+                    u = x1 + local_u
+                    v = y1 + local_v
+                    radius = r_roi
+                    target_score = score_roi
+                    search_mode = "ROI_TRACKING"
+
+                    # Hız tahmini güncelleme (Exponential Moving Average)
+                    alpha = 0.4
+                    new_vx = u - last_u
+                    new_vy = v - last_v
+                    self.velocity[0] = alpha * new_vx + (1.0 - alpha) * self.velocity[0]
+                    self.velocity[1] = alpha * new_vy + (1.0 - alpha) * self.velocity[1]
+
+                    self.last_target_center = (u, v)
+                    self.last_target_radius = radius
+                    self.tracking_confidence += 1
+                    self.roi_missed_count = 0
+                else:
+                    self.roi_missed_count += 1
+                    if self.roi_missed_count >= self.max_roi_missed_frames:
+                        # ROI'de bulamazsa takibi sıfırla, Global aramaya geç
+                        self.tracking = False
+                        self.last_target_center = None
+                        self.velocity = [0.0, 0.0]
+
+        # 2. Global (Tüm Kare) Arama Modu (Takipte değilse veya ROI başarısız olduysa)
+        if not found:
+            found_g, u_g, v_g, r_g, _, score_g = self.detect_target_in_image(frame, is_roi=False)
+            if found_g:
+                found = True
+                u, v, radius = u_g, v_g, r_g
+                target_score = score_g
+                search_mode = "GLOBAL_SEARCH"
+
+                self.tracking = True
+                self.last_target_center = (u, v)
+                self.last_target_radius = radius
+                self.velocity = [0.0, 0.0]
+                self.tracking_confidence = 1
+                self.roi_missed_count = 0
+            else:
+                self.tracking = False
+                self.tracking_confidence = 0
 
         # Resim merkezini (artı göstergesi) çiz
         cv2.drawMarker(
@@ -239,8 +411,22 @@ class TargetDetector(Node):
             cv2.circle(debug_img, (u, v), 4, (0, 0, 255), -1)
             cv2.line(debug_img, (center_u, center_v), (u, v), (0, 255, 255), 2)
 
+            # ROI kutusunu görselleştir (Takip modundaysa)
+            if roi_box is not None and search_mode == "ROI_TRACKING":
+                rx1, ry1, rx2, ry2 = roi_box
+                cv2.rectangle(debug_img, (rx1, ry1), (rx2, ry2), (0, 255, 255), 1)
+                cv2.putText(
+                    debug_img,
+                    f"ROI Track (Conf: {self.tracking_confidence})",
+                    (rx1, max(15, ry1 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 255, 255),
+                    1,
+                )
+
             info_str = f"Yaw: {yaw_deg:.2f} deg, Pitch: {pitch_deg:.2f} deg"
-            pix_str = f"du: {du:.1f}px, dv: {dv:.1f}px"
+            pix_str = f"du: {du:.1f}px, dv: {dv:.1f}px [{search_mode}] Score: {target_score:.1f}"
 
             cv2.putText(
                 debug_img,
@@ -264,13 +450,21 @@ class TargetDetector(Node):
         else:
             cv2.putText(
                 debug_img,
-                "Hedef Aranıyor...",
+                "Hedef Aranıyor (Global)...",
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 0, 255),
                 2,
             )
+
+        # Ekranda pencere göster (isteğe bağlı veya webcam modunda varsayılan)
+        if self.show_window:
+            cv2.imshow("Target Detection (Bilgisayar Kamerasi)", debug_img)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord('q'):  # ESC veya 'q' tuşuna basıldığında çık
+                self.get_logger().info("Kullanıcı çıkış yaptı (q/ESC).")
+                rclpy.shutdown()
 
         # Debug görüntüsünü yayınla
         try:
@@ -280,13 +474,41 @@ class TargetDetector(Node):
             self.get_logger().error(f"Debug görüntü yayınlama hatası: {e}")
 
 
+    def destroy_node(self):
+        if self.cap is not None and self.cap.isOpened():
+            self.cap.release()
+        cv2.destroyAllWindows()
+        super().destroy_node()
+
+
 def main(args=None):
+    use_webcam_cli = False
+    device_id_cli = 0
+    show_window_cli = False
+
+    # CLI argümanlarını kontrol et (--webcam, --device X, --show)
+    for arg in sys.argv[1:]:
+        if arg in ("--webcam", "-w"):
+            use_webcam_cli = True
+            show_window_cli = True
+        elif arg.startswith("--device=") or arg.startswith("-d="):
+            try:
+                device_id_cli = int(arg.split("=")[1])
+            except ValueError:
+                pass
+        elif arg in ("--show", "-s"):
+            show_window_cli = True
+
     rclpy.init(args=args)
-    node = TargetDetector()
+    node = TargetDetector(
+        use_webcam_cli=use_webcam_cli,
+        device_id_cli=device_id_cli,
+        show_window_cli=show_window_cli,
+    )
 
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
