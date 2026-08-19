@@ -24,7 +24,6 @@ class DynamicObstacleNode(Node):
         # Parameters
         self.declare_parameter("initial_stage", 0)
         self.declare_parameter("target_speed", 0.35)
-        self.declare_parameter("brake_speed", -0.15)
         self.declare_parameter("brake_duration", 0.4)
         self.declare_parameter("detection_min_x", 0.4)
         self.declare_parameter("detection_max_x", 2.2)
@@ -89,7 +88,6 @@ class DynamicObstacleNode(Node):
             return
 
         target_speed = float(self.get_parameter("target_speed").value)
-        brake_speed = float(self.get_parameter("brake_speed").value)
         brake_duration = float(self.get_parameter("brake_duration").value)
         detection_min_x = float(self.get_parameter("detection_min_x").value)
         detection_max_x = float(self.get_parameter("detection_max_x").value)

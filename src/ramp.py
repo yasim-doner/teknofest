@@ -39,11 +39,9 @@ class RampNode(Node):
         self.declare_parameter("laser_duration", 1.2)
         self.declare_parameter("flat_drive_duration", 1.0)
         self.declare_parameter("top_flat_drive_duration", 1.5)
-        self.declare_parameter("down_flat_drive_duration", 1.0)
         self.declare_parameter("ramp_up_drive_duration", 1.2)
-        self.declare_parameter("top_brake_speed", -0.18)
+        self.declare_parameter("descent_drive_duration", 2.0)
         self.declare_parameter("top_brake_duration", 0.35)
-        self.declare_parameter("down_brake_speed", -0.80)
         self.declare_parameter("down_brake_duration", 2.0)
 
         self.active_stages = [8, 9, 10]
@@ -61,11 +59,9 @@ class RampNode(Node):
         self.laser_duration = float(self.get_parameter("laser_duration").value)
         self.flat_drive_duration = float(self.get_parameter("flat_drive_duration").value)
         self.top_flat_drive_duration = float(self.get_parameter("top_flat_drive_duration").value)
-        self.down_flat_drive_duration = float(self.get_parameter("down_flat_drive_duration").value)
         self.ramp_up_drive_duration = float(self.get_parameter("ramp_up_drive_duration").value)
-        self.top_brake_speed = float(self.get_parameter("top_brake_speed").value)
+        self.descent_drive_duration = float(self.get_parameter("descent_drive_duration").value)
         self.top_brake_duration = float(self.get_parameter("top_brake_duration").value)
-        self.down_brake_speed = float(self.get_parameter("down_brake_speed").value)
         self.down_brake_duration = float(self.get_parameter("down_brake_duration").value)
 
         self.current_stage = self.initial_stage
@@ -224,14 +220,9 @@ class RampNode(Node):
             self.flat_confirm_frames = 0
 
         # Flat pitch check after descending
-        if self.state == "DESCENDING_RAMP":
-            if abs_pitch >= self.ramp_pitch_threshold:
+        if self.state in ("START_DESCENT", "DESCENT_DRIVING"):
+            if abs_pitch >= self.ramp_pitch_threshold or abs_pitch >= math.radians(5.0):
                 self.descent_pitch_seen = True
-
-            if self.descent_pitch_seen and abs_pitch <= self.flat_pitch_threshold:
-                self.descent_flat_frames += 1
-            else:
-                self.descent_flat_frames = 0
 
     def control_loop(self):
         if self.current_stage not in self.active_stages:
@@ -303,31 +294,31 @@ class RampNode(Node):
             # Target_detect handles laser firing and publishes release(9), moving stage to 10
             if self.current_stage == 10:
                 self.descent_pitch_seen = False
-                self.descent_flat_frames = 0
-                self.set_state("DESCENDING_RAMP")
-                self.get_logger().info("Target detect lazer görevini tamamladı (Stage 9 -> 10). Rampadan iniliyor.")
+                self.set_state("START_DESCENT")
+                self.get_logger().info("Target detect lazer görevini tamamladı (Stage 9 -> 10). İniş sürüşü başlatılıyor.")
 
-        elif self.state == "DESCENDING_RAMP":
-            # Driving forward down the ramp
+        elif self.state == "START_DESCENT":
+            # Driving forward off top platform towards descent slope
             self.publish_parking_brake(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
-            # Check if descent slope finished or timeout reached
-            if self.descent_flat_frames >= 4 or self.elapsed_in_state() >= 4.0:
-                self.set_state("DRIVING_OFF_RAMP_FLAT")
+            # Descent slope entered (pitch >= 5 deg or threshold)
+            if self.descent_pitch_seen:
+                self.set_state("DESCENT_DRIVING")
                 self.get_logger().warning(
-                    f"Rampadan iniş düzlüğü algılandı. Fren öncesi {self.down_flat_drive_duration}s sürüşe devam ediliyor."
+                    f"[İNİŞ EĞİMİ ALGILANDI] Rampa iniş eğimine girildi (Pitch={math.degrees(self.pitch):.1f}°). "
+                    f"{self.descent_drive_duration}s boyunca rampadan iniliyor..."
                 )
 
-        elif self.state == "DRIVING_OFF_RAMP_FLAT":
-            # Continue driving forward on flat ground for down_flat_drive_duration (0.5s) before applying brake
+        elif self.state == "DESCENT_DRIVING":
+            # Driving forward down the ramp for descent_drive_duration
             self.publish_parking_brake(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
-            if self.elapsed_in_state() >= self.down_flat_drive_duration:
+            if self.elapsed_in_state() >= self.descent_drive_duration:
                 self.set_state("RAMP_DOWN_STOP")
                 self.get_logger().warning(
-                    f"İniş sonrası düzlük sürüşü tamamlandı. Park freni aktif ediliyor ({self.down_brake_duration}s)."
+                    f"Rampa iniş sürüşü ({self.descent_drive_duration}s) tamamlandı. Park freni aktif ediliyor ({self.down_brake_duration}s)."
                 )
 
         elif self.state == "RAMP_DOWN_STOP":

@@ -278,6 +278,10 @@ class CmdSwitchNode(Node):
         if self.active_stage >= self.final_stage:
             return
 
+        # ardışık olarak /teknofest/release sinyalleriyle sırayla geçirilir.
+        if self.active_stage in (9, 10):
+            return
+
         interval = self.stage_interval_seconds()
         if (
             interval is not None
@@ -386,17 +390,21 @@ class CmdSwitchNode(Node):
         if released_stage != self.active_stage:
             return
 
-        self.get_logger().info(
-            f"Stage {released_stage} kontrolü bıraktı. "
-            "Fallow corridor'a dönülüyor."
-        )
-
         self.released_stage = released_stage
-        self.active_stage = 0
 
-        stop_msg = Twist()
-        self.cmd_vel_pub.publish(stop_msg)
+        if released_stage == 8:
+            self.active_stage = 9
+            self.get_logger().info("[STAGE GEÇİŞİ] Stage 8 (Tırmanma) serbest bırakıldı -> Stage 9 (Atış)")
+        elif released_stage == 9:
+            self.active_stage = 10
+            self.get_logger().info("[STAGE GEÇİŞİ] Stage 9 (Atış) serbest bırakıldı -> Stage 10 (İniş)")
+        else:
+            self.active_stage = 0
+            self.get_logger().info(f"[STAGE GEÇİŞİ] Stage {released_stage} tamamlandı -> Stage 0 (Fallow Corridor)")
+            stop_msg = Twist()
+            self.cmd_vel_pub.publish(stop_msg)
 
+        self.record_stage_change()
         self.publish_stage()
 
 

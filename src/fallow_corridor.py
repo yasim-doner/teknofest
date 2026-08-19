@@ -227,15 +227,25 @@ class FallowCorridorNode(Node):
         # Keep cruising speed CONSTANT at target_speed (0.5 m/s) - Never slow down or stop!
         linear_x = target_speed
 
-        # 4. Incline Speed Compensation
+        # Clamp angular velocity limit
+        angular_z = np.clip(angular_z, -max_angular_speed, max_angular_speed)
+
+        # Smooth steering transition to prevent abrupt/jerky turns
+        self.last_angular_z = 0.65 * self.last_angular_z + 0.35 * angular_z
+        angular_z = self.last_angular_z
+
+        # 4. Incline Speed Compensation & Turn Speed Adaptation
         speed_factor = 1.0
         if self.has_imu and linear_x > 0.0:
             speed_factor = 1.0 - (self.current_pitch * pitch_scale_factor)
             speed_factor = np.clip(speed_factor, min_speed_factor, max_speed_factor)
             linear_x = linear_x * speed_factor
 
-        # Clamp angular velocity limit
-        angular_z = np.clip(angular_z, -max_angular_speed, max_angular_speed)
+        # Ease linear speed slightly during sharp turns to allow tighter turning radius
+        if abs(angular_z) > 0.4:
+            turn_ease = min(1.0, (abs(angular_z) - 0.4) / 1.0)
+            linear_x = linear_x * (1.0 - 0.25 * turn_ease)
+            linear_x = max(min_speed, linear_x)
 
         # Publish velocities
         cmd_msg = Twist()
