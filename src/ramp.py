@@ -89,14 +89,14 @@ class RampNode(Node):
             "/ramp/cmd_vel",
             10,
         )
-        self.laser_pub = self.create_publisher(
-            Bool,
-            "/teknofest/laser_on",
-            10,
-        )
         self.release_pub = self.create_publisher(
             Int32,
             "/teknofest/release",
+            10,
+        )
+        self.parking_brake_pub = self.create_publisher(
+            Bool,
+            "/rover/parking_brake",
             10,
         )
 
@@ -160,16 +160,16 @@ class RampNode(Node):
         cmd.angular.z = float(angular_z)
         self.cmd_vel_pub.publish(cmd)
 
-    def publish_laser(self, is_on):
-        msg = Bool()
-        msg.data = bool(is_on)
-        self.laser_pub.publish(msg)
-
     def publish_release(self, stage_num):
         msg = Int32()
         msg.data = int(stage_num)
         self.release_pub.publish(msg)
         self.get_logger().info(f"Stage {stage_num} serbest bırakıldı (/teknofest/release={stage_num}).")
+
+    def publish_parking_brake(self, enable: bool):
+        msg = Bool()
+        msg.data = bool(enable)
+        self.parking_brake_pub.publish(msg)
 
     def reset_task(self):
         self.ramp_up_confirm_frames = 0
@@ -177,8 +177,8 @@ class RampNode(Node):
         self.descent_pitch_seen = False
         self.descent_flat_frames = 0
 
+        self.publish_parking_brake(False)
         self.publish_velocity(0.0, 0.0)
-        self.publish_laser(False)
         self.set_state("WAIT_STAGE")
 
     def stage_callback(self, msg):
@@ -236,12 +236,11 @@ class RampNode(Node):
     def control_loop(self):
         if self.current_stage not in self.active_stages:
             self.publish_velocity(0.0, 0.0)
-            self.publish_laser(False)
             return
 
         if self.state == "APPROACH_RAMP":
             # Driving towards ramp
-            self.publish_laser(False)
+            self.publish_parking_brake(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
             # Ramp climb detected (pitch >= threshold)
@@ -254,7 +253,7 @@ class RampNode(Node):
 
         elif self.state == "DRIVING_UP_RAMP_MID":
             # Driving up the slope towards the middle of the ramp incline
-            self.publish_laser(False)
+            self.publish_parking_brake(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
             if self.elapsed_in_state() >= self.ramp_up_drive_duration:
@@ -265,9 +264,9 @@ class RampNode(Node):
                 )
 
         elif self.state == "RAMP_UP_STOP":
-            # Stop at ramp middle
+            # Stop at ramp middle with active parking brake
+            self.publish_parking_brake(True)
             self.publish_velocity(0.0, 0.0)
-            self.publish_laser(False)
 
             if self.elapsed_in_state() >= self.stop_duration:
                 self.set_state("CLIMBING_RAMP")
@@ -275,7 +274,7 @@ class RampNode(Node):
 
         elif self.state == "CLIMBING_RAMP":
             # Climbing ramp towards the top flat area
-            self.publish_laser(False)
+            self.publish_parking_brake(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
             # Reached top flat area via IMU flat detection
@@ -287,44 +286,30 @@ class RampNode(Node):
 
         elif self.state == "DRIVING_ON_TOP_FLAT":
             # Continue driving forward on top flat platform for top_flat_drive_duration (1.5s) before stopping
-            self.publish_laser(False)
+            self.publish_parking_brake(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
             if self.elapsed_in_state() >= self.top_flat_drive_duration:
                 self.publish_velocity(0.0, 0.0)
                 self.set_state("STOPPING_AT_TOP")
                 self.publish_release(8)  # Stage 8 (Tırmanma) bitti -> Stage 9 (Tepe/Lazer)
-                self.get_logger().warning("Tepe düzlüğü sürüşü tamamlandı (Stage 8 -> 9). Atış için duruluyor.")
+                self.get_logger().warning("Tepe düzlüğü sürüşü tamamlandı (Stage 8 -> 9). Park freni aktif, target_detect bekleniyor.")
 
         elif self.state == "STOPPING_AT_TOP":
-            # Reverse brake pulse for first top_brake_duration seconds to cancel forward momentum
-            elapsed = self.elapsed_in_state()
-            self.publish_laser(False)
-            if elapsed < self.top_brake_duration:
-                self.publish_velocity(linear_x=self.top_brake_speed)
-            else:
-                self.publish_velocity(0.0, 0.0)
-
-            if elapsed >= self.stop_duration:
-                self.set_state("LASER_ON")
-                self.get_logger().warning("Atış duruş süresi doldu. Lazer açılıyor.")
-
-        elif self.state == "LASER_ON":
-            # Laser on for laser_duration (1.2s)
+            # Engage parking brake to hold position while waiting for target_detect to complete Stage 9
+            self.publish_parking_brake(True)
             self.publish_velocity(0.0, 0.0)
-            self.publish_laser(True)
 
-            if self.elapsed_in_state() >= self.laser_duration:
-                self.publish_laser(False)
+            # Target_detect handles laser firing and publishes release(9), moving stage to 10
+            if self.current_stage == 10:
                 self.descent_pitch_seen = False
                 self.descent_flat_frames = 0
                 self.set_state("DESCENDING_RAMP")
-                self.publish_release(9)  # Stage 9 (Lazer) bitti -> Stage 10 (İniş)
-                self.get_logger().info("Lazer görevi tamamlandı (Stage 9 -> 10). Rampadan iniliyor.")
+                self.get_logger().info("Target detect lazer görevini tamamladı (Stage 9 -> 10). Rampadan iniliyor.")
 
         elif self.state == "DESCENDING_RAMP":
             # Driving forward down the ramp
-            self.publish_laser(False)
+            self.publish_parking_brake(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
             # Check if descent slope finished or timeout reached
@@ -335,33 +320,30 @@ class RampNode(Node):
                 )
 
         elif self.state == "DRIVING_OFF_RAMP_FLAT":
-            # Continue driving forward on flat ground for down_flat_drive_duration (0.5s) before applying reverse brake
-            self.publish_laser(False)
+            # Continue driving forward on flat ground for down_flat_drive_duration (0.5s) before applying brake
+            self.publish_parking_brake(False)
             self.publish_velocity(linear_x=self.drive_speed)
 
             if self.elapsed_in_state() >= self.down_flat_drive_duration:
                 self.set_state("RAMP_DOWN_STOP")
                 self.get_logger().warning(
-                    f"İniş sonrası düzlük sürüşü tamamlandı. {self.down_brake_duration}s boyunca ters hız uygulanacak."
+                    f"İniş sonrası düzlük sürüşü tamamlandı. Park freni aktif ediliyor ({self.down_brake_duration}s)."
                 )
 
         elif self.state == "RAMP_DOWN_STOP":
-            # Reverse speed / braking pulse for down_brake_duration seconds (2.0s) to cancel downhill momentum
+            # Engage parking brake to cancel downhill momentum and hold position
             elapsed = self.elapsed_in_state()
-            self.publish_laser(False)
-            if elapsed < self.down_brake_duration:
-                self.publish_velocity(linear_x=self.down_brake_speed)
-            else:
-                self.publish_velocity(0.0, 0.0)
+            self.publish_parking_brake(True)
+            self.publish_velocity(0.0, 0.0)
 
             if elapsed >= max(self.stop_duration, self.down_brake_duration):
                 self.set_state("DONE")
                 self.publish_release(10)  # Stage 10 (İniş/Son) bitti
-                self.get_logger().info("Rampa iniş ters frenlemesi ve duruşu tamamlandı. Stage 10 görevi bitti.")
+                self.get_logger().info("Rampa iniş park frenlemesi ve duruşu tamamlandı. Stage 10 görevi bitti.")
 
         elif self.state == "DONE":
+            self.publish_parking_brake(False)
             self.publish_velocity(0.0, 0.0)
-            self.publish_laser(False)
 
 
 def main(args=None):
@@ -375,7 +357,7 @@ def main(args=None):
     finally:
         if rclpy.ok():
             node.publish_velocity(linear_x=0.0)
-            node.publish_laser(False)
+            node.publish_parking_brake(False)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

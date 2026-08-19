@@ -49,7 +49,8 @@ class TargetDetector(Node):
         self.declare_parameter("image_topic", "/rover/camera/image_raw")
         self.declare_parameter("fx", 525.0)
         self.declare_parameter("fy", 525.0)
-        self.declare_parameter("active_stage", 8)
+        self.declare_parameter("active_stage", 9)
+        self.declare_parameter("laser_duration", 1.2)
         self.declare_parameter("use_webcam", use_webcam_cli)
         self.declare_parameter("device_id", device_id_cli)
         self.declare_parameter("show_window", show_window_cli or use_webcam_cli)
@@ -58,6 +59,7 @@ class TargetDetector(Node):
         self.fx = float(self.get_parameter("fx").value)
         self.fy = float(self.get_parameter("fy").value)
         self.active_stage = int(self.get_parameter("active_stage").value)
+        self.laser_duration = float(self.get_parameter("laser_duration").value)
         self.use_webcam = bool(self.get_parameter("use_webcam").value)
         self.device_id = int(self.get_parameter("device_id").value)
         self.show_window = bool(self.get_parameter("show_window").value)
@@ -69,7 +71,11 @@ class TargetDetector(Node):
         # State & Data Variables
         self.current_stage = 0
         self.laser_active = False
+        self.parking_brake_active = False
         self.result_saved = False
+        self.shot_started = False
+        self.shot_start_time = None
+        self.shot_completed = False
 
         # ROI & Motion Tracking State
         self.tracking = False
@@ -104,6 +110,16 @@ class TargetDetector(Node):
             "/teknofest/target_debug_image",
             10,
         )
+        self.laser_pub = self.create_publisher(
+            Bool,
+            "/teknofest/laser_on",
+            10,
+        )
+        self.release_pub = self.create_publisher(
+            Int32,
+            "/teknofest/release",
+            10,
+        )
 
         # Subscriptions
         self.stage_sub = self.create_subscription(
@@ -112,10 +128,10 @@ class TargetDetector(Node):
             self.stage_callback,
             10,
         )
-        self.laser_on_sub = self.create_subscription(
+        self.parking_brake_sub = self.create_subscription(
             Bool,
-            "/teknofest/laser_on",
-            self.laser_on_callback,
+            "/rover/parking_brake",
+            self.parking_brake_callback,
             10,
         )
 
@@ -144,11 +160,26 @@ class TargetDetector(Node):
     def stage_callback(self, msg):
         self.current_stage = int(msg.data)
 
-    def laser_on_callback(self, msg):
-        new_state = bool(msg.data)
-        if new_state and not self.laser_active:
-            self.result_saved = False
-        self.laser_active = new_state
+    def parking_brake_callback(self, msg):
+        self.parking_brake_active = bool(msg.data)
+
+    def is_target_detection_active(self):
+        """
+        Hedef tespiti sadece araç rampada tepedeyken ve park freni aktif durumdayken (Stage 9 + Park Freni) çalışır.
+        """
+        return self.current_stage in (9, self.active_stage) and self.parking_brake_active
+
+    def publish_laser(self, enable: bool):
+        msg = Bool()
+        msg.data = bool(enable)
+        self.laser_active = bool(enable)
+        self.laser_pub.publish(msg)
+
+    def publish_release(self, stage_num: int):
+        msg = Int32()
+        msg.data = int(stage_num)
+        self.release_pub.publish(msg)
+        self.get_logger().info(f"Stage {stage_num} serbest bırakıldı (/teknofest/release={stage_num}).")
 
     def save_target_result(self, debug_img, yaw_deg, pitch_deg, du, dv, score):
         try:
@@ -327,6 +358,16 @@ class TargetDetector(Node):
         self.process_frame(frame)
 
     def process_frame(self, frame):
+        if not self.is_target_detection_active():
+            if self.shot_started and not self.shot_completed:
+                self.publish_laser(False)
+            self.tracking = False
+            self.result_saved = False
+            self.shot_started = False
+            self.shot_start_time = None
+            self.shot_completed = False
+            return
+
         h, w = frame.shape[:2]
         debug_img = frame.copy()
         center_u, center_v = w // 2, h // 2
@@ -479,10 +520,28 @@ class TargetDetector(Node):
                 1,
             )
 
-            # Tepedeyken / Lazer aktifken sonucu otomatik kaydet
-            if (self.laser_active or self.current_stage == 8) and not self.result_saved:
-                self.save_target_result(debug_img, yaw_deg, pitch_deg, du, dv, target_score)
-                self.result_saved = True
+            # Lazer Atış Mantığı (Sadece target_detect kontrol eder)
+            if not self.shot_started and not self.shot_completed:
+                self.shot_started = True
+                self.shot_start_time = self.get_clock().now()
+                self.publish_laser(True)
+                self.get_logger().warning("[TARGET DETECT] Hedef kilitlendi! Lazer açılıyor (/teknofest/laser_on = True).")
+                if not self.result_saved:
+                    self.save_target_result(debug_img, yaw_deg, pitch_deg, du, dv, target_score)
+                    self.result_saved = True
+
+        # Atış süresinin dolup dolmadığını kontrol et ve Stage 9'u serbest bırak
+        if self.shot_started and not self.shot_completed:
+            elapsed = (self.get_clock().now() - self.shot_start_time).nanoseconds / 1e9
+            if elapsed < self.laser_duration:
+                self.publish_laser(True)
+            else:
+                self.publish_laser(False)
+                self.shot_completed = True
+                self.get_logger().warning(
+                    f"[TARGET DETECT] Lazer atışı ({self.laser_duration}s) tamamlandı. Stage 9 serbest bırakılıyor."
+                )
+                self.publish_release(9)
 
         else:
             cv2.putText(

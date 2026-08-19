@@ -7,7 +7,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
-from std_msgs.msg import Int32
+from std_msgs.msg import Bool, Int32
 
 
 class DynamicObstacleNode(Node):
@@ -62,6 +62,11 @@ class DynamicObstacleNode(Node):
         self.release_pub = self.create_publisher(
             Int32,
             "/teknofest/release",
+            10,
+        )
+        self.parking_brake_pub = self.create_publisher(
+            Bool,
+            "/rover/parking_brake",
             10,
         )
 
@@ -169,25 +174,16 @@ class DynamicObstacleNode(Node):
 
         # 5. Barrier State Decision
         if obstacle_count >= min_points_threshold:
-            # Barrier CLOSED: Stop & Wait with brief reverse braking pulse
-            if self.stop_start_time is None:
-                self.stop_start_time = self.get_clock().now()
-
-            elapsed_stop = (self.get_clock().now() - self.stop_start_time).nanoseconds / 1e9
-            if elapsed_stop < brake_duration:
-                cmd_msg = Twist()
-                cmd_msg.linear.x = brake_speed
-                cmd_msg.angular.z = 0.0
-                self.cmd_vel_pub.publish(cmd_msg)
-            else:
-                self.stop_robot()
-
+            # Barrier CLOSED: Stop & Wait with parking brake engaged
+            self.publish_parking_brake(True)
+            self.stop_robot()
             self.get_logger().info(
-                f"[DUR-BEKLE] Bariyer kapalı (Nokta: {obstacle_count}). Ters Fren: {brake_speed} m/s ({elapsed_stop:.2f}s)",
+                f"[DUR-BEKLE] Bariyer kapalı (Nokta: {obstacle_count}). Park freni aktif.",
                 throttle_duration_sec=0.5,
             )
         else:
             # Barrier OPEN: Start crossing
+            self.publish_parking_brake(False)
             self.stop_start_time = None
             self.clear_start_time = self.get_clock().now()
             cmd_msg = Twist()
@@ -197,6 +193,11 @@ class DynamicObstacleNode(Node):
             self.get_logger().info(
                 f"[GEÇİŞ BAŞLADI] Ön koridor temiz (Nokta: {obstacle_count} < {min_points_threshold}). İlerleniyor."
             )
+
+    def publish_parking_brake(self, enable: bool):
+        msg = Bool()
+        msg.data = bool(enable)
+        self.parking_brake_pub.publish(msg)
 
     def stop_robot(self):
         cmd_msg = Twist()

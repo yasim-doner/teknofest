@@ -126,7 +126,7 @@ target_detect:
     # Gazebo Sim  (640x480)  : fx = 320.0, fy = 320.0  (HFOV = 90°)
     fx: 320.0
     fy: 320.0
-    active_stage: 8
+    active_stage: 9
     use_webcam: false
     device_id: 0
     show_window: false
